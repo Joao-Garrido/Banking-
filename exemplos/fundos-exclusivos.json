@@ -1,0 +1,11 @@
+{
+  "_nota": "IDATIVO -> carteira do fundo exclusivo, para as visões com explosão. O IDATIVO é o que aparece na folha POSICOES (ticker, ou a descrição normalizada). A soma de 'valor' tem de ser igual ao valor da cota no statement — se não for, a conferência falha.",
+  "FIE_EXEMPLO": {
+    "nome": "FIE Família Exemplo",
+    "carteira": [
+      {"idativo": "TESOURO_IPCA_2035", "descricao": "Tesouro IPCA+ 2035", "classe": "Renda Fixa", "valor": "1500000.00", "quantidade": "350.0", "pu": "4285.71"},
+      {"idativo": "CDB_BANCO_A", "descricao": "CDB Banco A 105% CDI", "classe": "Renda Fixa", "valor": "500000.00"},
+      {"idativo": "ACOES_BR", "descricao": "Carteira de ações Brasil", "classe": "Renda Variável", "valor": "250000.00"}
+    ]
+  }
+}

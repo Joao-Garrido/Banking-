@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from src.excel import table_state, write_workbook
+from src.export import Explosion, build_export, explosion_checks
 from src.model import build_datasets, dataset_checks, portfolio_checks
 from src.lines import read_pages
 from src.mapper import build_layout
@@ -82,6 +83,19 @@ def run_sweep(pdf: Path, args) -> int:
     sweep.checks.extend(dataset_checks(datasets, sweep.tables))
     sweep.checks.extend(portfolio_checks(datasets, sweep.tables, accounts))
 
+    clients = _load_json(args.clientes, "clientes")
+    exclusive = _load_json(args.fundos_exclusivos, "fundos exclusivos")
+    # Sem fundos exclusivos declarados não há nada para explodir: gerar três
+    # folhas iguais seria ruído.
+    modes = args.explosao or (list(Explosion.ALL) if exclusive else [Explosion.NONE])
+    export = build_export(
+        datasets, layout, clients=clients, exclusive_funds=exclusive,
+        moeda=args.moeda, modes=modes,
+    )
+    sweep.checks.extend(explosion_checks(export, exclusive))
+    for note in export.notes:
+        print(f"  · {note}")
+
     conciliadas = [c for c in sweep.checks if c.passed]
     print(f"\n{len(sweep.tables)} tabelas · {len(conciliadas)} conferências conciliadas · "
           f"{len(sweep.failures)} falhas · {len(sweep.warnings)} avisos")
@@ -102,6 +116,7 @@ def run_sweep(pdf: Path, args) -> int:
         tables=sweep.tables,
         checks=sweep.checks,
         datasets=datasets,
+        export=export,
         include_diagnostics=not args.no_diagnostics,
         include_raw=not args.no_raw,
     )
@@ -128,6 +143,15 @@ def run_sweep(pdf: Path, args) -> int:
 
     print("Sem contradições entre o extraído e os totais impressos.")
     return 0
+
+
+def _load_json(path: str | None, what: str) -> dict:
+    if not path:
+        return {}
+    file = Path(path)
+    if not file.exists():
+        raise FileNotFoundError(f"ficheiro de {what} não encontrado: {file}")
+    return json.loads(file.read_text(encoding="utf-8"))
 
 
 def _write_table_csv(path: Path, result) -> None:
@@ -303,6 +327,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="não escreve nada se alguma reconciliação falhar")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="omite a coluna com o texto original de cada linha")
+    parser.add_argument("--clientes", help="JSON conta -> {idcliente, nome} para o IDCLIENTE")
+    parser.add_argument("--fundos-exclusivos", dest="fundos_exclusivos",
+                        help="JSON IDATIVO -> {nome, carteira[]} dos fundos exclusivos")
+    parser.add_argument("--explosao", action="append", choices=list(Explosion.ALL),
+                        help="visão de posições a gerar; repetível (default: todas se houver "
+                             "fundos exclusivos declarados, senão só 'nao')")
+    parser.add_argument("--moeda", default="USD", help="moeda do statement (default: USD)")
     parser.add_argument("--no-raw", action="store_true",
                         help="omite as folhas com as tabelas em bruto (só as vistas)")
     parser.add_argument("--sections", action="store_true",

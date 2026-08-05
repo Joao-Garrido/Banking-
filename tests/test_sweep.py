@@ -120,7 +120,9 @@ class TestExcel:
 
         book = load_workbook(workbook)
         assert book.sheetnames[0] == "Capa"
-        assert "Posições" in book.sheetnames
+        # Layout do consolidador primeiro, vistas analíticas a seguir.
+        assert book.sheetnames[1:4] == ["POSICOES", "MOVIMENTOS", "De-para"]
+        assert "Posições (análise)" in book.sheetnames
         assert "Reconciliação" in book.sheetnames
         assert "Tabelas do documento" in book.sheetnames
 

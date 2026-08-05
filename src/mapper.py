@@ -207,17 +207,61 @@ def _account_label(lines: Sequence[Line], position: int) -> str | None:
     return None
 
 
-def detect_statement_year(per_page: dict[int, list[Line]]) -> tuple[int | None, list[str]]:
-    """Ano do período — necessário para as datas que o documento imprime como '12/8'."""
+# 'For the Period December 1-31, 2016' -> 2016-12-01 a 2016-12-31.
+PERIOD = re.compile(
+    r"(?P<mes>January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(?P<inicio>\d{1,2})\s*[-–]\s*(?P<fim>\d{1,2}),\s*(?P<ano>\d{4})",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def detect_period(per_page: dict[int, list[Line]]) -> tuple[dict, list[str]]:
+    """Período do statement: ano (para as datas sem ano) e data de posição.
+
+    A data de posição é o fim do período — é ela que vai para `DT_POSICAO` na
+    exportação. Sem ela, quem carrega o ficheiro não sabe a que dia se refere a
+    carteira, e essa é a primeira coisa que um consolidador pergunta.
+    """
+    from datetime import date
+
+    for page in sorted(per_page)[:2]:
+        for line in per_page[page][:6]:
+            match = PERIOD.search(line.text)
+            if match:
+                year = int(match.group("ano"))
+                month = _MONTHS[match.group("mes").lower()]
+                start = date(year, month, int(match.group("inicio")))
+                end = date(year, month, int(match.group("fim")))
+                return (
+                    {
+                        "statement_year": year,
+                        "period_start": start.isoformat(),
+                        "period_end": end.isoformat(),
+                    },
+                    [f"período {start.isoformat()} a {end.isoformat()} — confirma"],
+                )
+
     for page in sorted(per_page)[:2]:
         for line in per_page[page][:6]:
             match = YEAR.search(line.text)
             if match:
                 year = int(match.group(0))
-                return year, [f"statement_year={year}, lido de {line.text.strip()!r} — confirma"]
-    return None, [
-        "ano do período não encontrado: datas sem ano ('12/8') vão levantar exceção até "
-        "'statement_year' ser preenchido à mão"
+                return (
+                    {"statement_year": year, "period_start": None, "period_end": None},
+                    [
+                        f"statement_year={year} lido de {line.text.strip()!r}, mas as datas de "
+                        "início e fim do período não foram reconhecidas: preenche "
+                        "'period_end' à mão (é a data de posição)"
+                    ],
+                )
+
+    return {"statement_year": None, "period_start": None, "period_end": None}, [
+        "período não encontrado: datas sem ano ('12/8') vão levantar exceção e a data de "
+        "posição fica por preencher"
     ]
 
 
@@ -397,8 +441,8 @@ def build_layout(
     )
     notes = band_notes + notes
 
-    statement_year, year_notes = detect_statement_year(per_page)
-    notes.extend(year_notes)
+    period, period_notes = detect_period(per_page)
+    notes.extend(period_notes)
 
     # Num statement consolidado, o mesmo título ('HOLDINGS') repete-se uma vez
     # por conta. O índice é construído dentro de cada conta e só depois unido.
@@ -467,7 +511,7 @@ def build_layout(
         "version": LAYOUT_VERSION,
         "generated_from": path.name,
         "page_count": len(per_page),
-        "statement_year": statement_year,
+        **period,
         "y_tolerance": 2.5,
         "body_band": body_band,
         "accounts": accounts,

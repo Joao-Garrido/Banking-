@@ -37,6 +37,13 @@ from .model import (
     Dataset,
     Domain,
 )
+from .export import (
+    MOVIMENTO_COLUMNS,
+    POSICAO_COLUMNS,
+    TIPO_MOVIMENTO,
+    Explosion,
+    ExportSet,
+)
 from .reconcile import Check
 
 __all__ = ["write_workbook", "table_state", "checks_for"]
@@ -113,13 +120,15 @@ def table_state(spec, checks: Sequence[Check]) -> str:
 # --------------------------------------------------------------- primitivas
 
 def _sheet_name(used: set[str], base: str) -> str:
+    """Nome único de folha. A comparação é sem maiúsculas porque é assim que o
+    Excel decide: 'POSICOES' e 'Posições' seriam a mesma folha para ele."""
     name = _INVALID_SHEET.sub(" ", base).strip()[:MAX_SHEET_NAME]
     suffix = 2
-    while name in used:
+    while name.casefold() in used:
         tail = f" ({suffix})"
         name = name[: MAX_SHEET_NAME - len(tail)] + tail
         suffix += 1
-    used.add(name)
+    used.add(name.casefold())
     return name
 
 
@@ -136,7 +145,29 @@ def _value(value: Any) -> Any:
     return str(value)
 
 
+# Formato das colunas do layout de exportação, pelo nome.
+_EXPORT_MONEY = re.compile(r"^(VLR_|VALOR|PU$|CUSTO_UNITARIO|RESULTADO_|RENDIMENTO_)")
+_EXPORT_QUANTITY = re.compile(r"^QUANTIDADE$")
+_EXPORT_PERCENT = re.compile(r"^(TAXA_YIELD|PESO_PCT)$")
+_EXPORT_DATE = re.compile(r"^DT_")
+
+
+def _export_format(column: str) -> str | None:
+    if _EXPORT_MONEY.match(column):
+        return MONEY_FORMAT
+    if _EXPORT_QUANTITY.match(column):
+        return QUANTITY_FORMAT
+    if _EXPORT_PERCENT.match(column):
+        return PERCENT_FORMAT
+    if _EXPORT_DATE.match(column):
+        return DATE_FORMAT
+    return None
+
+
 def _number_format(field: str, value: Any) -> str | None:
+    export_format = _export_format(field)
+    if export_format:
+        return export_format
     if field in MONEY_FIELDS:
         return MONEY_FORMAT
     if field in QUANTITY_FIELDS:
@@ -222,6 +253,7 @@ def write_workbook(
     tables: Sequence,
     checks: Sequence[Check],
     datasets: dict[str, Dataset],
+    export: ExportSet | None = None,
     include_diagnostics: bool = True,
     include_raw: bool = True,
 ) -> Path:
@@ -233,11 +265,20 @@ def write_workbook(
     capa.sheet_properties.tabColor = VIEW_TAB_COLOR
 
     view_sheets: list[tuple[str, str, int, Decimal | None]] = []
+
+    if export is not None:
+        view_sheets.extend(_write_export(workbook, export, used_names))
+
     for domain in DOMAIN_ORDER:
         dataset = datasets.get(domain)
         if dataset is None or not dataset.rows or domain == Domain.OTHER:
             continue
-        name = _sheet_name(used_names, dataset.title)
+        # As folhas do layout do consolidador ficam com o nome cru (POSICOES,
+        # MOVIMENTOS); a vista analítica do mesmo tema leva o sufixo, para não
+        # haver dúvida sobre qual é a que se carrega no sistema.
+        colide = export is not None and domain in (Domain.POSITIONS, Domain.TRANSACTIONS)
+        title = f"{dataset.title} (análise)" if colide else dataset.title
+        name = _sheet_name(used_names, title)
         sheet = workbook.create_sheet(name)
         sheet.sheet_properties.tabColor = VIEW_TAB_COLOR
         fields = [f for f in dataset.fields if any(f in row for row in dataset.rows)]
@@ -408,6 +449,95 @@ def _write_capa(
         row += 1
         sheet.cell(row=row, column=1, value="·")
         sheet.cell(row=row, column=2, value=nota)
+
+
+def _write_export(
+    workbook: Workbook, export: ExportSet, used_names: set[str]
+) -> list[tuple[str, str, int, Decimal | None]]:
+    """Folhas no layout do consolidador: POSICOES, MOVIMENTOS e o De-para."""
+    sheets: list[tuple[str, str, int, Decimal | None]] = []
+    labels = {column: column for column in POSICAO_COLUMNS + MOVIMENTO_COLUMNS}
+    widths = {
+        "DESCRICAO_ATIVO": 46, "DESCRICAO": 52, "CLASSE_ATIVO": 34, "IDATIVO": 24,
+        "NOME_CLIENTE": 24, "CONTA": 17, "TABELA_ORIGEM": 28, "TIPO_ORIGINAL": 24,
+        "PAGINA": 7, "ORIGEM_EXPLOSAO": 18, "FUNDO_EXCLUSIVO": 16,
+    }
+
+    for mode, linhas in export.posicoes.items():
+        title = "POSICOES" if mode == Explosion.NONE else f"POSICOES ({mode})"
+        name = _sheet_name(used_names, title)
+        sheet = workbook.create_sheet(name)
+        sheet.sheet_properties.tabColor = VIEW_TAB_COLOR
+        _write_table(
+            sheet,
+            POSICAO_COLUMNS,
+            linhas,
+            labels=labels,
+            widths=widths,
+            total_fields=["VLR_BRUTO_MOEDA_ORIGINAL"],
+        )
+        total = sum(
+            (
+                linha["VLR_BRUTO_MOEDA_ORIGINAL"]
+                for linha in linhas
+                if isinstance(linha.get("VLR_BRUTO_MOEDA_ORIGINAL"), Decimal)
+            ),
+            Decimal("0"),
+        )
+        sheets.append((title, name, len(linhas), total))
+
+    name = _sheet_name(used_names, "MOVIMENTOS")
+    sheet = workbook.create_sheet(name)
+    sheet.sheet_properties.tabColor = VIEW_TAB_COLOR
+    _write_table(
+        sheet, MOVIMENTO_COLUMNS, export.movimentos, labels=labels, widths=widths,
+        total_fields=["VALOR"],
+    )
+    total_mov = sum(
+        (m["VALOR"] for m in export.movimentos if isinstance(m.get("VALOR"), Decimal)),
+        Decimal("0"),
+    )
+    sheets.append(("MOVIMENTOS", name, len(export.movimentos), total_mov))
+
+    _write_de_para(workbook, _sheet_name(used_names, "De-para"), export)
+    return sheets
+
+
+def _write_de_para(workbook: Workbook, name: str, export: ExportSet) -> None:
+    """O que preenche cada campo do layout — e o que fica vazio, com o motivo."""
+    sheet = workbook.create_sheet(name)
+    sheet.sheet_properties.tabColor = VIEW_TAB_COLOR
+
+    fields = ["CAMPO", "ESTADO", "ORIGEM", "NOTA"]
+    labels = {"CAMPO": "Campo", "ESTADO": "Estado", "ORIGEM": "Origem", "NOTA": "Nota"}
+    last = _write_table(
+        sheet, fields, export.mapping, labels=labels,
+        widths={"CAMPO": 34, "ESTADO": 14, "ORIGEM": 60, "NOTA": 70},
+    )
+
+    for offset, row in enumerate(export.mapping, start=2):
+        if row["ESTADO"] != "preenchido":
+            sheet.cell(row=offset, column=2).fill = STATE_FILLS["parcial"]
+
+    row = last + 3
+    sheet.cell(row=row, column=1, value="De-para do tipo de movimento").font = LABEL_FONT
+    row += 1
+    for column, label in enumerate(("Tipo impresso no statement", "Código"), start=1):
+        cell = sheet.cell(row=row, column=column, value=label)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+    for original, codigo in TIPO_MOVIMENTO.items():
+        row += 1
+        sheet.cell(row=row, column=1, value=original)
+        sheet.cell(row=row, column=2, value=codigo)
+
+    if export.notes:
+        row += 2
+        sheet.cell(row=row, column=1, value="Notas").font = LABEL_FONT
+        for nota in export.notes:
+            row += 1
+            sheet.cell(row=row, column=1, value="·")
+            sheet.cell(row=row, column=2, value=nota)
 
 
 def _write_checks(workbook: Workbook, name: str, checks: Sequence[Check]) -> None:

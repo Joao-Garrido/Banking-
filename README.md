@@ -20,17 +20,20 @@ aparece marcado como *não verificável* — nunca como certo.
 
 ```bash
 pip install -r requirements.txt
-pytest                      # 150 testes
+pytest                      # 166 testes
 ```
 
 ## O que sai
 
-`out/statement.xlsx`, organizado como um dossier — primeiro as vistas de
-trabalho, no fim o documento em bruto para auditoria:
+`out/statement.xlsx`, organizado como um dossier — primeiro o que se carrega no
+sistema, depois as vistas de trabalho, no fim o documento em bruto para auditoria:
 
 | Folha | Conteúdo |
 |---|---|
 | **Capa** | documento, contas, e por conta: valor das posições, por liquidar, total impresso e se fecha |
+| **POSICOES** | layout do consolidador: `IDCLIENTE`, `IDATIVO`, `DESCRICAO_ATIVO`, `MOEDA`, `DT_POSICAO`, `QUANTIDADE`, `PU`, `VLR_CUSTO_MOEDA_ORIGINAL`, `VLR_BRUTO_MOEDA_ORIGINAL`, `VALOR_IR`, `VALOR_IOF`, `VALOR_LIQUIDO`, … |
+| **MOVIMENTOS** | `DT_MOVIMENTO`, `TIPO_MOVIMENTO` (A, RP, JUROS, DIV, TRF, TX…), `TIPO_ORIGINAL`, `IDATIVO`, `QUANTIDADE`, `PU`, `VALOR` |
+| **De-para** | campo a campo: de onde veio, o que ficou vazio e porquê, e a tradução dos tipos de movimento |
 | **Sumário por conta** | as rubricas de variação do período, tal como impressas |
 | **Posições** | todas as posições das duas contas numa tabela: classe de ativo, título, símbolo, quantidade, custo, preço, valor de mercado, mais-valia potencial, yield, **peso %** |
 | **Alocação** | alocação por classe, por conta |
@@ -96,11 +99,15 @@ src/
   normalize.py           (1,234.56) -> -1234.56, datas, moeda, marcadores ST/LT
   tables.py              varredura: encontra e extrai todas as tabelas
   model.py               camada canónica: tabelas -> posições/movimentos/…
+  export.py              layout do consolidador + fundo exclusivo
   router.py              página -> secção, página -> conta
   reconcile.py           vocabulário das conferências (erro vs aviso)
   excel.py               escrita do livro
   pipeline.py            cola
   sections/              secções curadas: holdings, activity, income, fees
+exemplos/
+  clientes.json          conta -> idcliente (modelo)
+  fundos-exclusivos.json carteira dos fundos exclusivos (modelo)
 tests/
   expected.json          totais digitados à mão (modo curado)
   fixtures/              statement sintético + layout revisto
@@ -178,6 +185,50 @@ ao cêntimo:
 
 Mais as provas cruzadas entre o detalhe de cada conta e a linha de resumo da
 página do sumário.
+
+---
+
+## O layout do consolidador
+
+As folhas `POSICOES` e `MOVIMENTOS` estão no formato que os sistemas de
+consolidação esperam, para serem carregadas sem trabalho manual.
+
+```bash
+python parse.py statement.pdf \
+    --clientes exemplos/clientes.json \
+    --fundos-exclusivos exemplos/fundos-exclusivos.json \
+    --explosao nao --explosao consolidado --explosao detalhado \
+    --moeda USD
+```
+
+**`IDCLIENTE`** vem do mapeamento de contas em `--clientes`; sem ele fica o
+número da conta. **`IDATIVO`** é o ticker quando existe e, quando não existe, a
+descrição normalizada — determinístico entre execuções, que é o que permite
+ligar a posição de hoje à de ontem. **`DT_POSICAO`** é o fim do período lido do
+statement.
+
+**Campo que o documento não dá fica vazio, nunca a zero.** `VALOR_IR`,
+`VALOR_IOF` e `VALOR_LIQUIDO` saem vazios num statement de custódia
+norte-americano: escrever `0` afirmaria que o imposto foi zero. A folha
+`De-para` diz isto campo a campo, e também que `AM`, `RT` e `COME_COTAS` nunca
+ocorrem neste custodiante — a ausência é do documento, não do parser.
+
+**`TIPO_MOVIMENTO` é tradução, não interpretação.** O tipo impresso vai ao lado
+em `TIPO_ORIGINAL`, e o que não tiver correspondência clara sai como `OUTROS`.
+No statement de exemplo os 490 movimentos ficam todos codificados: 415 `A`,
+33 `TRF`, 18 `RP`, 18 `DIV`, 6 `JUROS`.
+
+### Fundo exclusivo
+
+`--fundos-exclusivos` recebe a carteira de cada fundo (o statement de custódia
+mostra a cota, não o que está dentro dela). Com ela, `--explosao` gera as
+visões pedidas — `nao`, `consolidado` (carteira agregada por classe) e
+`detalhado` (ativo a ativo) — cada uma na sua folha, com a coluna
+`ORIGEM_EXPLOSAO` a dizer de que fundo veio cada linha.
+
+Explodir muda a composição, nunca o total: **a soma da carteira explodida tem
+de repor exatamente o valor da cota que substituiu**, e é conferido. Sem
+fundos declarados sai só a visão `nao`, com nota a dizer porquê.
 
 ---
 

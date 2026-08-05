@@ -118,6 +118,10 @@ INCOME_EXCLUDE = re.compile(r"reinvestment", re.IGNORECASE)
 # Tipos de movimento que o statement imprime no início da descrição.
 ACTIVITY_TYPES = [
     "Dividend Reinvestment",
+    "Automatic Redemption",
+    "Cash Transfer",
+    "Bought",
+    "Sold",
     "Long Term Capital Gain",
     "Short Term Capital Gain",
     "Capital Gain Reinvestment",

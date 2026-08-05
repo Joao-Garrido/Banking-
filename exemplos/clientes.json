@@ -1,0 +1,7 @@
+{
+  "_nota": "Conta do statement -> identificação do cliente no vosso sistema. A chave é o número da conta tal como aparece no cabeçalho das páginas; use \"\" para um statement de conta única.",
+  "000-000000-000": {
+    "idcliente": "C-0001",
+    "nome": "Família Exemplo"
+  }
+}
