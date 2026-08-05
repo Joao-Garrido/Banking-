@@ -1,0 +1,169 @@
+{
+  "version": 2,
+  "generated_from": "synthetic_statement.pdf",
+  "page_count": 6,
+  "statement_year": null,
+  "y_tolerance": 2.5,
+  "body_band": {
+    "top": 42.66,
+    "bottom": 755.45
+  },
+  "accounts": [],
+  "sections": {
+    "holdings": {
+      "present": true,
+      "pages": [
+        2,
+        3
+      ],
+      "anchor": "center",
+      "columns": [
+        {
+          "name": "description",
+          "x0": 37.0,
+          "x1": 286.97,
+          "type": "text"
+        },
+        {
+          "name": "quantity",
+          "x0": 286.97,
+          "x1": 356.24,
+          "type": "quantity"
+        },
+        {
+          "name": "price",
+          "x0": 356.24,
+          "x1": 438.73,
+          "type": "amount"
+        },
+        {
+          "name": "market_value",
+          "x0": 438.73,
+          "x1": 523.0,
+          "type": "amount"
+        }
+      ],
+      "amount_column": "market_value",
+      "description_column": "description",
+      "row_start": {
+        "kind": "numeric_in",
+        "column": "market_value"
+      },
+      "total_label_patterns": [
+        "^Total\\s+(Holdings|Portfolio)",
+        "^Total\\s+Market\\s+Value"
+      ],
+      "ignore_patterns": [
+        "^(Security|Description)\\b.*\\bMarket\\s+Value\\b",
+        "continued"
+      ]
+    },
+    "activity": {
+      "present": true,
+      "pages": [
+        4
+      ],
+      "anchor": "center",
+      "columns": [
+        {
+          "name": "description",
+          "x0": 37.0,
+          "x1": 470.97,
+          "type": "text"
+        },
+        {
+          "name": "amount",
+          "x0": 470.97,
+          "x1": 523.0,
+          "type": "amount"
+        }
+      ],
+      "amount_column": "amount",
+      "description_column": "description",
+      "row_start": {
+        "kind": "date"
+      },
+      "total_label_patterns": [
+        "^Total\\s+Activity",
+        "^Net\\s+(Cash\\s+)?Flows?"
+      ],
+      "ignore_patterns": [
+        "^(Date|Settlement)\\b.*\\bAmount\\b",
+        "continued"
+      ]
+    },
+    "income": {
+      "present": true,
+      "pages": [
+        5
+      ],
+      "anchor": "center",
+      "columns": [
+        {
+          "name": "description",
+          "x0": 37.0,
+          "x1": 476.97,
+          "type": "text"
+        },
+        {
+          "name": "amount",
+          "x0": 476.97,
+          "x1": 523.0,
+          "type": "amount"
+        }
+      ],
+      "amount_column": "amount",
+      "description_column": "description",
+      "row_start": {
+        "kind": "date"
+      },
+      "total_label_patterns": [
+        "^Total\\s+Income",
+        "^Total\\s+(Dividends|Interest)"
+      ],
+      "ignore_patterns": [
+        "^Date\\b.*\\bAmount\\b",
+        "continued"
+      ]
+    },
+    "fees": {
+      "present": true,
+      "pages": [
+        6
+      ],
+      "anchor": "center",
+      "columns": [
+        {
+          "name": "description",
+          "x0": 37.0,
+          "x1": 481.97,
+          "type": "text"
+        },
+        {
+          "name": "amount",
+          "x0": 481.97,
+          "x1": 523.0,
+          "type": "amount"
+        }
+      ],
+      "amount_column": "amount",
+      "description_column": "description",
+      "row_start": {
+        "kind": "date"
+      },
+      "total_label_patterns": [
+        "^Total\\s+(Fees|Charges|Expenses)"
+      ],
+      "ignore_patterns": [
+        "^Date\\b.*\\bAmount\\b",
+        "continued"
+      ]
+    }
+  },
+  "_review": [
+    "banda do corpo y=[42.66, 755.45] — cortado como footer: 'este documento não é um statement real. page # of #'",
+    "banda do corpo y=[42.66, 755.45] — cortado como header: 'morgan stanley · documento sintético de teste account ###-######'",
+    "nenhum número de conta encontrado no cabeçalho — tratado como statement de conta única; se for consolidado, ajusta ACCOUNT_NUMBER no mapper",
+    "ano do período não encontrado: datas sem ano ('12/8') vão levantar exceção até 'statement_year' ser preenchido à mão"
+  ]
+}

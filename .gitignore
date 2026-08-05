@@ -1,0 +1,13 @@
+# Statements reais: nomes, números de conta e saldos não vão para o repositório.
+tests/fixtures/real/
+*.pdf
+!tests/fixtures/synthetic_statement.pdf
+
+# Saída do parser
+out/
+layout.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/

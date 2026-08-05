@@ -1,0 +1,4 @@
+pdfplumber>=0.11
+pymupdf>=1.24
+pandas>=2.0
+pytest>=8.0

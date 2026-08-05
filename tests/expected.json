@@ -1,0 +1,56 @@
+{
+  "_como_preencher": [
+    "Este ficheiro é o gabarito da Fase 0 e é preenchido À MÃO, lendo os números",
+    "impressos no PDF. Não o gerar a partir do output do parser: se o gabarito vier",
+    "do parser, o parser passa sempre e o arnês deixa de valer alguma coisa.",
+    "Todos os valores são strings para não perder precisão (viram Decimal).",
+    "A chave de cada statement é o caminho da fixture."
+  ],
+  "statements": {
+    "tests/fixtures/synthetic_statement.pdf": {
+      "_nota": "Documento SINTÉTICO gerado por tests/make_synthetic_fixture.py. Existe para provar o arnês, não substitui um statement real.",
+      "portfolio_total": "1195590.55",
+      "activity_rollforward": {
+        "beginning_value": "1140000.00",
+        "net_flows": "26754.60",
+        "market_change": "28835.95",
+        "ending_value": "1195590.55"
+      },
+      "sections": {
+        "holdings": {
+          "subtotal": "1195590.55",
+          "row_count": 6
+        },
+        "activity": {
+          "subtotal": "26754.60",
+          "row_count": 4
+        },
+        "income": {
+          "subtotal": "12255.00",
+          "row_count": 3
+        },
+        "fees": {
+          "subtotal": "2020.40",
+          "row_count": 2
+        }
+      }
+    }
+  },
+  "_template_statement_real": {
+    "tests/fixtures/COLOCAR_AQUI.pdf": {
+      "portfolio_total": "0.00",
+      "activity_rollforward": {
+        "beginning_value": "0.00",
+        "net_flows": "0.00",
+        "market_change": "0.00",
+        "ending_value": "0.00"
+      },
+      "sections": {
+        "holdings": { "subtotal": "0.00", "row_count": 0 },
+        "activity": { "subtotal": "0.00", "row_count": 0 },
+        "income": { "subtotal": "0.00", "row_count": 0 },
+        "fees": { "subtotal": "0.00", "row_count": 0 }
+      }
+    }
+  }
+}
