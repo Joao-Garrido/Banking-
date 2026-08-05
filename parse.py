@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from src.excel import table_state, write_workbook
+from src.model import build_datasets, dataset_checks, portfolio_checks
 from src.lines import read_pages
 from src.mapper import build_layout
 from src.pipeline import parse_statement, section_dataframe, sweep_statement
@@ -74,6 +75,13 @@ def run_sweep(pdf: Path, args) -> int:
     layout, _layout_path, pages = resolve_layout(pdf, args.layout, relayout=args.relayout)
     sweep = sweep_statement(pdf, layout, pages=pages)
 
+    accounts = layout.get("accounts", [])
+    datasets = build_datasets(sweep.tables, accounts)
+    # As vistas consolidadas também são conferidas: não podem perder nem
+    # duplicar dinheiro em relação às tabelas de onde vieram.
+    sweep.checks.extend(dataset_checks(datasets, sweep.tables))
+    sweep.checks.extend(portfolio_checks(datasets, sweep.tables, accounts))
+
     conciliadas = [c for c in sweep.checks if c.passed]
     print(f"\n{len(sweep.tables)} tabelas · {len(conciliadas)} conferências conciliadas · "
           f"{len(sweep.failures)} falhas · {len(sweep.warnings)} avisos")
@@ -93,7 +101,9 @@ def run_sweep(pdf: Path, args) -> int:
         layout=layout,
         tables=sweep.tables,
         checks=sweep.checks,
+        datasets=datasets,
         include_diagnostics=not args.no_diagnostics,
+        include_raw=not args.no_raw,
     )
     print(f"\nescrito: {destination}")
 
@@ -293,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="não escreve nada se alguma reconciliação falhar")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="omite a coluna com o texto original de cada linha")
+    parser.add_argument("--no-raw", action="store_true",
+                        help="omite as folhas com as tabelas em bruto (só as vistas)")
     parser.add_argument("--sections", action="store_true",
                         help="modo secções curadas (CSV + summary.json) em vez da varredura")
     parser.add_argument("--section", action="append", dest="sections_only",

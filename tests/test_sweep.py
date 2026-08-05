@@ -119,13 +119,18 @@ class TestExcel:
         assert workbook.exists()
 
         book = load_workbook(workbook)
-        assert book.sheetnames[:3] == ["Resumo", "Reconciliação", "Totais impressos"]
-        assert len(book.sheetnames) == 3 + 5
+        assert book.sheetnames[0] == "Capa"
+        assert "Posições" in book.sheetnames
+        assert "Reconciliação" in book.sheetnames
+        assert "Tabelas do documento" in book.sheetnames
 
-        resumo = book["Resumo"]
-        header = [cell.value for cell in resumo[1]]
-        assert "soma extraída" in header and "estado" in header
-        estados = {row[header.index("estado")].value for row in resumo.iter_rows(min_row=2, max_row=6)}
+        indice = book["Tabelas do documento"]
+        header = [cell.value for cell in indice[1]]
+        assert "Soma extraída" in header and "Estado" in header
+        estados = {
+            row[header.index("Estado")].value
+            for row in indice.iter_rows(min_row=2, max_row=6)
+        }
         assert estados == {"conciliado"}
 
         totais = book["Totais impressos"]
@@ -197,13 +202,21 @@ class TestEstruturaDeLotes:
 
 
 class TestRegrasDeClassificacao:
-    def test_data_no_inicio_ou_no_fim_sai_da_descricao(self):
+    def test_datas_no_inicio_ou_no_fim_saem_da_descricao(self):
         from src.tables import _leading_or_trailing_date
 
-        assert _leading_or_trailing_date("12/8 Funds Received") == ("Funds Received", "12/8")
-        assert _leading_or_trailing_date("FUND A (AAAAX) 3/10/16") == ("FUND A (AAAAX)", "3/10/16")
-        assert _leading_or_trailing_date("FUND A (AAAAX)") == ("FUND A (AAAAX)", None)
-        assert _leading_or_trailing_date("3/10/16") == ("", "3/10/16")
+        assert _leading_or_trailing_date("12/8 Funds Received") == ("Funds Received", ["12/8"])
+        assert _leading_or_trailing_date("FUND A (AAAAX) 3/10/16") == (
+            "FUND A (AAAAX)",
+            ["3/10/16"],
+        )
+        assert _leading_or_trailing_date("FUND A (AAAAX)") == ("FUND A (AAAAX)", [])
+        assert _leading_or_trailing_date("3/10/16") == ("", ["3/10/16"])
+        # Mais-valias: data de compra e data de venda na mesma célula.
+        assert _leading_or_trailing_date("SEC A 12/21/16 12/30/16") == (
+            "SEC A",
+            ["12/21/16", "12/30/16"],
+        )
 
     @pytest.mark.parametrize(
         "label, title, expected",

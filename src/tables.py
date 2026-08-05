@@ -45,7 +45,7 @@ ROW_TYPES = ("data", "subtotal", "total", "info")
 # que a soma do que extraímos é conferida.
 TOTAL_PATTERNS = [
     r"^total\b(?!\s+purchases\s+vs)",
-    r"^net\s+(credits|debits|unsettled|value\s+of)",
+    r"^net\s+(credits|debits|unsettled|activity|value\s+of)",
     r"^grand\s+total\b",
     # Mais-valias: o total do período está no topo da tabela, sem a palavra
     # 'total'. Sem o reconhecer, ele era somado como se fosse mais uma venda.
@@ -100,9 +100,10 @@ _NON_WORD = re.compile(r"[^a-z0-9]+")
 # interest)'. Aceitar títulos capitalizados fazia com que headers de coluna
 # ('Date Activity Type Description') passassem por títulos e partissem tabelas
 # ao meio; o statement escreve os seus títulos em maiúsculas, e é isso que vale.
-_HEADING = re.compile(r"^[A-Z][A-Z0-9 &/,.'\-]{3,60}(?:\s*\([^)]{0,60}\))?$")
+_HEADING = re.compile(r"^[A-Z][A-Z0-9 &/,.'()\-]{3,70}(?:\s*\([^)]{0,60}\))?$")
 _CONTINUED = re.compile(r"\s*\(CONTINUED\)\s*$", re.IGNORECASE)
 _PLAIN_TOTAL = re.compile(r"^totals?$", re.IGNORECASE)
+_PERCENT = re.compile(r"^\(?-?[\d,]+(\.\d+)?\)?\s*%$")
 
 
 def _slug(text: str) -> str:
@@ -182,22 +183,28 @@ def _is_tabular_number(text: str) -> bool:
     return bool(_FORMATTED.search(text)) and looks_like_amount_loose(text)
 
 
-def _leading_or_trailing_date(text: str) -> tuple[str, str | None]:
-    """Separa a data que o statement imprime no início ou no fim da descrição.
+def _leading_or_trailing_date(text: str) -> tuple[str, list[str]]:
+    """Separa as datas que o statement imprime no início ou no fim da descrição.
 
     As datas não formam coluna própria (não têm a pontuação que distingue um
-    número de tabela), por isso caem na descrição. Tirá-las daqui dá uma coluna
-    de data utilizável e — mais importante — impede que a data de um lote passe
-    por nome da posição no agrupamento.
+    número de tabela), por isso caem na descrição. Tirá-las daqui dá colunas de
+    data utilizáveis e — mais importante — impede que a data de um lote passe
+    por nome da posição no agrupamento. Podem ser duas: as tabelas de
+    mais-valias imprimem data de compra *e* data de venda.
     """
     words = text.split()
-    if not words:
-        return text, None
-    if DATE_PATTERN.match(words[0]):
-        return " ".join(words[1:]), words[0]
-    if len(words) > 1 and DATE_PATTERN.match(words[-1]):
-        return " ".join(words[:-1]), words[-1]
-    return text, None
+    leading: list[str] = []
+    trailing: list[str] = []
+
+    while words and DATE_PATTERN.match(words[0]):
+        leading.append(words.pop(0))
+    while len(words) > 1 and DATE_PATTERN.match(words[-1]):
+        trailing.insert(0, words.pop())
+    # Uma descrição feita só de datas ('12/21/16 12/30/16') fica vazia, e é isso
+    # mesmo: o registo é do título acima, não de um título novo.
+    if not words and len(trailing) == 0 and len(leading) > 1:
+        pass
+    return " ".join(words), leading + trailing
 
 
 def _is_numeric_line(line: Line) -> bool:
@@ -564,9 +571,11 @@ def extract_table(spec: TableSpec, *, statement_year: int | None = None) -> Tabl
         for column in columns:
             raw = cells[column["name"]]
             if column["name"] == "description":
-                description, date_token = _leading_or_trailing_date(raw)
+                description, date_tokens = _leading_or_trailing_date(raw)
                 row["description"] = description
-                row["date"] = _as_date(date_token, statement_year)
+                dates = [_as_date(token, statement_year) for token in date_tokens]
+                row["date"] = dates[0] if dates else None
+                row["dates"] = dates
                 continue
             row[column["name"]] = _cell_value(
                 raw, spec, head.page, column["name"], result, statement_year
@@ -659,6 +668,10 @@ def _cell_value(
         return parse_date(raw, year=statement_year)
     except NormalizeError:
         pass
+    if _PERCENT.match(raw.strip()):
+        # Percentagem numa coluna de valores: não é dinheiro, fica como texto
+        # para não entrar em soma nenhuma — e não é um problema de leitura.
+        return raw.strip()
     if column == spec.amount_column:
         result.problems.append(
             f"p.{page}: coluna de valor {column!r} com célula não interpretável: {raw!r}"

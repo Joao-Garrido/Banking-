@@ -20,19 +20,37 @@ aparece marcado como *não verificável* — nunca como certo.
 
 ```bash
 pip install -r requirements.txt
-pytest                      # 128 testes
+pytest                      # 150 testes
 ```
 
 ## O que sai
 
-`out/statement.xlsx`, com:
+`out/statement.xlsx`, organizado como um dossier — primeiro as vistas de
+trabalho, no fim o documento em bruto para auditoria:
 
 | Folha | Conteúdo |
 |---|---|
-| **Resumo** | uma linha por tabela: conta, páginas, nº de linhas, soma extraída, total impresso, **estado** |
+| **Capa** | documento, contas, e por conta: valor das posições, por liquidar, total impresso e se fecha |
+| **Sumário por conta** | as rubricas de variação do período, tal como impressas |
+| **Posições** | todas as posições das duas contas numa tabela: classe de ativo, título, símbolo, quantidade, custo, preço, valor de mercado, mais-valia potencial, yield, **peso %** |
+| **Alocação** | alocação por classe, por conta |
+| **Movimentos** | todos os movimentos: data, tipo, descrição, quantidade, preço, valor |
+| **Rendimento** | dividendos, juros e mais-valias distribuídas (derivado dos movimentos por tipo) |
+| **Mais-valias realizadas** | por título: data de compra, data de venda, receita, custo, ganho |
+| **Transferências e eventos** | transferências de títulos e corporate actions |
 | **Reconciliação** | cada conferência: PASS / FAIL / AVISO, extraído, esperado, delta, página, nota |
 | **Totais impressos** | todos os totais que o documento imprime, com página — as provas |
-| uma por tabela | as linhas, com `row_type` (`data`/`subtotal`/`total`/`info`), `group`, colunas do documento e a página de origem |
+| **Tabelas do documento** | índice das tabelas encontradas, com estado e ligação |
+| uma por tabela | o documento tal como foi lido: `row_type`, `group`, colunas do banco, página e texto original |
+
+As vistas consolidam as contas e contêm **apenas linhas de dados** — os
+subtotais e totais que o documento imprime ficam nas folhas em bruto. Somar uma
+coluna inteira nunca conta o mesmo dinheiro duas vezes. Cada linha aponta para a
+tabela, página e conta de origem.
+
+Nada é inventado: um campo que o documento não imprime fica vazio. As únicas
+colunas calculadas são `peso %` (sobre o total da conta) e a folha `Rendimento`
+(filtro dos movimentos por tipo, sem reinvestimentos) — ambas assinaladas na capa.
 
 O estado de cada tabela é um de quatro (e a cor do separador da folha repete-o):
 
@@ -77,6 +95,7 @@ src/
   lines.py               words -> linhas visuais -> registos
   normalize.py           (1,234.56) -> -1234.56, datas, moeda, marcadores ST/LT
   tables.py              varredura: encontra e extrai todas as tabelas
+  model.py               camada canónica: tabelas -> posições/movimentos/…
   router.py              página -> secção, página -> conta
   reconcile.py           vocabulário das conferências (erro vs aviso)
   excel.py               escrita do livro
@@ -142,9 +161,10 @@ O documento de exemplo (Dezembro/2016, 50 páginas, consolidado) obrigou a:
    cêntimos. O parser está certo; o documento é que arredonda. Está assinalado
    como tal, não escondido.
 
-Resultado nesse documento: **32 tabelas, 21 conferências conciliadas, zero
-contradições** — 11 tabelas conciliadas, 6 parciais, 15 sem total impresso para
-conferir. Entre as provadas ao cêntimo:
+Resultado nesse documento: **32 tabelas, 31 conferências conciliadas de 57, zero
+contradições** — 15 tabelas conciliadas, 4 parciais, 13 sem total impresso para
+conferir, e as duas contas a fechar contra o total impresso. Entre as provadas
+ao cêntimo:
 
 | Tabela | Linhas | Prova |
 |---|---|---|
@@ -158,6 +178,27 @@ conferir. Entre as provadas ao cêntimo:
 
 Mais as provas cruzadas entre o detalhe de cada conta e a linha de resumo da
 página do sumário.
+
+---
+
+## A camada canónica
+
+Cada tabela do documento é atribuída a um **domínio** pelo título (posições,
+movimentos, mais-valias, transferências, alocação, sumário) e cada coluna do
+banco a um **campo canónico** pelo nome (`market_value` → valor de mercado,
+`credits_debits` → valor, `sales_proceeds` → receita da venda). Daí saem as
+folhas consolidadas.
+
+Esta camada é conferida como tudo o resto: a soma de cada vista tem de ser igual
+à soma das mesmas colunas nas tabelas de origem, e uma tabela cuja coluna de
+valor não tenha equivalente canónico é dita em voz alta (`CORPORATE ACTIONS`
+mede-se em quantidade, não em dinheiro — as suas linhas aparecem sem valor).
+
+A prova de topo é por conta: **posições + operações por liquidar == total
+impresso da conta**. Numa conta com compras por liquidar o valor das posições
+excede o total — o statement já conta os títulos comprados, e a contrapartida em
+dinheiro só entra na liquidação. No documento de exemplo isso são
+9.368.342,88 − 2.238.795,33 = 7.129.547,55, exatamente o total impresso.
 
 ---
 
