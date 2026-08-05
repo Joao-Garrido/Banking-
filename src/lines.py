@@ -20,7 +20,15 @@ import pdfplumber
 
 from .normalize import DATE_PATTERN
 
-__all__ = ["Word", "Line", "extract_lines", "group_records", "starts_with_date"]
+__all__ = [
+    "Word",
+    "Line",
+    "extract_lines",
+    "read_pages",
+    "lines_in_band",
+    "group_records",
+    "starts_with_date",
+]
 
 WORD_ATTRS = ["size", "fontname"]
 
@@ -168,6 +176,44 @@ def extract_lines(
             collected.extend(words_from_page(page, index, body_band))
 
     return group_words_into_lines(collected, y_tolerance=y_tolerance)
+
+
+def read_pages(
+    pdf_path: str | Path, *, y_tolerance: float = 2.5
+) -> tuple[dict[int, list[Line]], dict[int, float]]:
+    """Todas as linhas do documento, por página, sem cortar banda nenhuma.
+
+    Existe para que o PDF seja lido uma vez só: o mapper precisa da página
+    inteira (o cabeçalho é o que lhe diz de que conta é a página) e a varredura
+    precisa do corpo. Cortar a banda em memória é mais barato do que reler.
+    """
+    per_page: dict[int, list[Line]] = {}
+    heights: dict[int, float] = {}
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for index, page in enumerate(pdf.pages, start=1):
+            words = words_from_page(page, index)
+            per_page[index] = group_words_into_lines(words, y_tolerance=y_tolerance)
+            heights[index] = float(page.height)
+    return per_page, heights
+
+
+def lines_in_band(
+    lines_by_page: dict[int, list[Line]], body_band: dict | None
+) -> dict[int, list[Line]]:
+    """Corta header/footer de linhas já lidas."""
+    if not body_band:
+        return {page: list(lines) for page, lines in lines_by_page.items()}
+
+    top = body_band.get("top")
+    bottom = body_band.get("bottom")
+    return {
+        page: [
+            line
+            for line in lines
+            if (top is None or line.top >= top) and (bottom is None or line.bottom <= bottom)
+        ]
+        for page, lines in lines_by_page.items()
+    }
 
 
 def starts_with_date(line: Line) -> bool:

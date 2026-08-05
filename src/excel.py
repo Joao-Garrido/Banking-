@@ -31,29 +31,57 @@ HEADER_FONT = Font(bold=True, color="FFFFFF")
 STATE_FILLS = {
     "conciliado": PatternFill("solid", fgColor="C6EFCE"),
     "não conciliado": PatternFill("solid", fgColor="FFC7CE"),
-    "não verificável": PatternFill("solid", fgColor="FFEB9C"),
     "parcial": PatternFill("solid", fgColor="FFEB9C"),
+    "não verificável": PatternFill("solid", fgColor="E7E6E6"),
 }
+# Cor do separador de cada folha: o estado vê-se sem abrir a tabela.
+STATE_TAB_COLOR = {
+    "conciliado": "70AD47",
+    "não conciliado": "C00000",
+    "parcial": "FFC000",
+    "não verificável": "A6A6A6",
+}
+
+LEGENDA = [
+    ("conciliado", "a soma do que foi extraído bate com o total impresso"),
+    ("parcial", "alguma conferência passou e outra ficou por provar"),
+    ("não conciliado", "não bate, e sabemos que devia bater"),
+    ("não verificável", "a tabela não imprime total: extraímos, mas não há prova"),
+]
 
 DIAGNOSTIC_COLUMNS = ("source_text",)
 
 
-def table_state(spec, checks: Sequence[Check]) -> str:
-    """Estado de uma tabela a partir das conferências que lhe dizem respeito."""
+def checks_for(spec, checks: Sequence[Check]) -> list[Check]:
+    """Conferências que dizem respeito a esta tabela."""
     pages = set(spec.pages)
-    mine = [
+    return [
         check
         for check in checks
         if check.section == spec.title and (check.page is None or check.page in pages)
     ]
-    if not mine:
-        return "não verificável"
+
+
+def table_state(spec, checks: Sequence[Check]) -> str:
+    """Estado de uma tabela, do mais grave para o mais brando.
+
+    'parcial' é o caso honesto do meio: alguma coisa ficou provada e outra não.
+    Chamar-lhe conciliado seria dizer mais do que sabemos.
+    """
+    mine = checks_for(spec, checks)
     if any(check.fatal for check in mine):
         return "não conciliado"
-    if all(check.passed for check in mine):
+    passed = [check for check in mine if check.passed]
+    if not passed:
+        return "não verificável"
+    if len(passed) == len(mine):
         return "conciliado"
-    # Passar numa conferência e ficar por provar noutra não é estar conciliado.
     return "parcial"
+
+
+def _checks_label(spec, checks: Sequence[Check]) -> str:
+    mine = checks_for(spec, checks)
+    return f"{sum(1 for c in mine if c.passed)}/{len(mine)}" if mine else "0/0"
 
 
 def _sheet_name(used: set[str], account: str | None, title: str) -> str:
@@ -149,6 +177,7 @@ def write_workbook(
                 # O mesmo número contra o qual a conferência foi feita — mostrar
                 # aqui outra soma faria a folha contradizer-se a si própria.
                 "total impresso": result.reference_total,
+                "conferências": _checks_label(spec, checks),
                 "estado": state,
             }
         )
@@ -171,6 +200,7 @@ def write_workbook(
             columns += [c for c in DIAGNOSTIC_COLUMNS]
 
         sheet = workbook.create_sheet(name)
+        sheet.sheet_properties.tabColor = STATE_TAB_COLOR.get(state)
         _style_header(
             sheet,
             columns,
@@ -204,6 +234,7 @@ def _write_summary(workbook: Workbook, pdf: str, layout: dict, rows: Sequence[di
         "coluna de valor",
         "soma extraída",
         "total impresso",
+        "conferências",
         "estado",
     ]
     _style_header(sheet, columns, widths={"tabela": 46, "designação da conta": 30, "folha": 32})
@@ -214,6 +245,10 @@ def _write_summary(workbook: Workbook, pdf: str, layout: dict, rows: Sequence[di
         fill = STATE_FILLS.get(row["estado"])
         if fill:
             cell.fill = fill
+
+        link = sheet.cell(row=index, column=columns.index("folha") + 1)
+        link.value = f'=HYPERLINK("#\'{row["folha"]}\'!A1","{row["folha"]}")'
+        link.style = "Hyperlink"
 
     footer = len(rows) + 3
     sheet.cell(row=footer, column=1, value="documento").font = Font(bold=True)
@@ -232,6 +267,15 @@ def _write_summary(workbook: Workbook, pdf: str, layout: dict, rows: Sequence[di
         ),
     )
 
+    sheet.cell(row=footer + 5, column=1, value="legenda").font = Font(bold=True)
+    for offset, (estado, explicacao) in enumerate(LEGENDA):
+        line = footer + 5 + offset
+        cell = sheet.cell(row=line, column=2, value=estado)
+        fill = STATE_FILLS.get(estado)
+        if fill:
+            cell.fill = fill
+        sheet.cell(row=line, column=3, value=explicacao)
+
 
 def _write_checks(workbook: Workbook, checks: Sequence[Check]) -> None:
     sheet = workbook.create_sheet("Reconciliação")
@@ -242,8 +286,14 @@ def _write_checks(workbook: Workbook, checks: Sequence[Check]) -> None:
         widths={"tabela": 40, "verificação": 34, "nota": 90, "estado": 14},
     )
 
+    # Falhas primeiro, depois o que ficou por provar: quem abre esta folha quer
+    # ver o que está mal, não percorrer trinta linhas verdes até lá chegar.
+    ordered = sorted(
+        checks, key=lambda c: (0 if c.fatal else (1 if not c.passed else 2), c.section)
+    )
+
     rows = []
-    for check in checks:
+    for check in ordered:
         rows.append(
             {
                 "estado": "PASS" if check.passed else ("FAIL" if check.fatal else "AVISO"),

@@ -20,7 +20,7 @@ aparece marcado como *não verificável* — nunca como certo.
 
 ```bash
 pip install -r requirements.txt
-pytest                      # 114 testes
+pytest                      # 128 testes
 ```
 
 ## O que sai
@@ -34,12 +34,15 @@ pytest                      # 114 testes
 | **Totais impressos** | todos os totais que o documento imprime, com página — as provas |
 | uma por tabela | as linhas, com `row_type` (`data`/`subtotal`/`total`/`info`), `group`, colunas do documento e a página de origem |
 
-O estado de cada tabela é um de quatro:
+O estado de cada tabela é um de quatro (e a cor do separador da folha repete-o):
 
-- **conciliado** — a soma do que foi extraído bate com o total impresso;
-- **não conciliado** — bate mal, e sabemos que devia bater;
-- **parcial** — passou numa conferência e ficou por provar noutra;
+- **conciliado** — todas as conferências passaram;
+- **parcial** — alguma passou e outra ficou por provar;
+- **não conciliado** — não bate, e sabemos que devia bater;
 - **não verificável** — a tabela não imprime total: extraímos, mas não há prova.
+
+A coluna `conferências` diz quantas passaram em quantas — o estado é auditável
+sem sair da folha.
 
 > Na soma entram só as linhas `data`. Somar de novo as linhas `subtotal`/`total`
 > conta o mesmo dinheiro duas vezes — a folha Resumo diz isto no rodapé.
@@ -99,12 +102,20 @@ tests/
    é continuação da descrição anterior.
 5. **Classificação** — cada linha é `data`, `subtotal`, `total` ou `info`, pelo
    rótulo (`Total`, `Purchases`, `Total Purchases vs Market Value`, …).
-6. **Conferência** — Σ das linhas `data` contra os totais impressos. É **erro**
-   apenas quando sabemos que a tabela devia somar (o total chama-se `Total` ou
-   traz o nome da tabela). Um `TOTAL ENDING VALUE` num quadro de roll-forward não
-   é a soma das linhas acima: aí a diferença sai como **aviso**, porque não prova
-   nem acerto nem erro. Diferenças até um cêntimo por total impresso são
-   assinaladas como arredondamento do próprio documento.
+6. **Grupos** — um `Total` sozinho fecha o título em curso (uma posição com
+   vários lotes), não a tabela. Cada um desses é conferido contra as suas
+   próprias linhas. Uma linha que se chame como a tabela (`STOCKS 19.42% …`) e
+   cujo valor seja pelo menos tão grande como qualquer outra é o total da
+   categoria — sem esta regra, ela era somada como se fosse mais uma posição e a
+   tabela ficava com o dobro do valor.
+7. **Conferência** — Σ das linhas `data` contra os totais impressos, ao nível
+   certo: por grupo e por tabela. É **erro** apenas quando sabemos que devia
+   somar (o total chama-se `Total` ou traz o nome da tabela). Um `TOTAL ENDING
+   VALUE` num quadro de roll-forward não é a soma das linhas acima: aí a
+   diferença sai como **aviso**, porque não prova nem acerto nem erro.
+8. **Arredondamento** — a folga é de um cêntimo por valor impresso que entra na
+   soma. Acima disso é erro. A diferença aparece sempre na folha
+   `Reconciliação`, seja qual for a classificação.
 
 ---
 
@@ -121,7 +132,8 @@ O documento de exemplo (Dezembro/2016, 50 páginas, consolidado) obrigou a:
 3. **Datas sem ano** (`12/8`). Só são aceites com `statement_year`; adivinhar o
    ano seria inventar dados.
 4. **Marcadores colados aos valores** (`$5,958.99ST`). Separados do número, não
-   ignorados.
+   ignorados. As datas (`12/8`, `3/10/16`) também saem da descrição para coluna
+   própria — sem isso, a data de um lote passava por nome da posição.
 5. **Sub-tabelas com colunas próprias** dentro da mesma secção (`MUTUAL FUNDS`,
    `COMMON STOCKS`, `CASH FLOW ACTIVITY BY DATE`, …) — foi isto que trocou o
    modelo "quatro secções" pela varredura por tabela.
@@ -130,11 +142,22 @@ O documento de exemplo (Dezembro/2016, 50 páginas, consolidado) obrigou a:
    cêntimos. O parser está certo; o documento é que arredonda. Está assinalado
    como tal, não escondido.
 
-Resultado nesse documento: 32 tabelas, 12 conferências conciliadas — incluindo
-`CASH FLOW ACTIVITY BY DATE` (215 linhas → `NET CREDITS/(DEBITS)` ao cêntimo),
-`UNSETTLED PURCHASES/SALES` (203 linhas), `SECURITY TRANSFERS` nas duas contas,
-e a prova cruzada entre o detalhe de cada conta e a linha de resumo da página do
-sumário. Zero contradições.
+Resultado nesse documento: **32 tabelas, 21 conferências conciliadas, zero
+contradições** — 11 tabelas conciliadas, 6 parciais, 15 sem total impresso para
+conferir. Entre as provadas ao cêntimo:
+
+| Tabela | Linhas | Prova |
+|---|---|---|
+| `COMMON STOCKS` | 186 | `STOCKS 19.42% … $1.384.278,01` |
+| `CASH FLOW ACTIVITY BY DATE` | 215 | `NET CREDITS/(DEBITS)` |
+| `UNSETTLED PURCHASES/SALES` | 203 | `NET UNSETTLED PURCHASES/SALES` |
+| `LONG-TERM GAIN/(LOSS)` | 70 | `Long-Term This Period $931.881,07` |
+| `SHORT-TERM GAIN/(LOSS)` | 40 | `Short-Term This Period $(894,27)` |
+| `SECURITY TRANSFERS` (2 contas) | 19 + 9 | `TOTAL SECURITY TRANSFERS` |
+| `MUTUAL FUNDS` | 50 | 4 das 7 posições ao cêntimo; as outras 3 dentro do arredondamento do documento |
+
+Mais as provas cruzadas entre o detalhe de cada conta e a linha de resumo da
+página do sumário.
 
 ---
 
@@ -159,7 +182,8 @@ partir do parser: se o gabarito vier do parser, o parser passa sempre.
 |---|---|---|
 | tabela `não conciliado` por ~2× o valor de uma linha | parênteses lidos como positivo | `normalize.parse_amount` + teste dedicado |
 | colunas trocadas a partir da página N | faixa x errada | `columns` da tabela no layout |
-| linhas a mais ou a menos | rótulo mal classificado | `TOTAL_PATTERNS` / `SUBTOTAL_PATTERNS` / `INFO_PATTERNS` em `src/tables.py` |
+| linhas a mais ou a menos | rótulo mal classificado | `TOTAL_PATTERNS` / `SUBTOTAL_PATTERNS` / `INFO_PATTERNS` / `CONTINUATION_LABELS` em `src/tables.py` |
+| soma exatamente ao dobro | linha de total contada como dados | confirma que o rótulo dessa linha se chama como a tabela |
 | tabela partida em duas folhas | título diferente entre páginas | confirma o título; `(CONTINUED)` já é tratado |
 | prosa a virar tabela | bloco de texto com números | `_keep_numeric_bands` já filtra; se escapar, ajusta a banda do corpo |
 | `data sem ano: '12/8'` | tabela de atividade sem ano | `statement_year` no layout |

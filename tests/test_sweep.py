@@ -15,7 +15,7 @@ import parse as entrypoint
 from src.excel import table_state
 from src.pipeline import sweep_statement
 from src.router import load_layout
-from src.tables import classify, detect_tables, extract_table
+from src.tables import classify
 from tests.make_synthetic_fixture import FIXTURE, build
 
 LAYOUT = Path("tests/fixtures/layout.synthetic.json")
@@ -148,3 +148,111 @@ class TestExcel:
         )
         assert code == 1
         assert not out.exists()
+
+
+class TestEstruturaDeLotes:
+    """A estrutura do statement real: lotes, subtotal, reinvestimentos, totais."""
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def lots(tmp_path_factory):
+        from src.mapper import build_layout
+        from tests.make_synthetic_fixture import build_lots
+
+        pdf = build_lots(tmp_path_factory.mktemp("lotes") / "lotes.pdf")
+        return sweep_statement(pdf, build_layout(pdf))
+
+    def test_uma_tabela(self, lots):
+        assert [t.spec.title for t in lots.tables] == ["MUTUAL FUNDS"]
+
+    def test_lote_sem_descricao_herda_o_titulo_acima(self, lots):
+        table = lots.tables[0]
+        assert [row["group"] for row in table.data_rows[:2]] == [
+            "FUND A GROWTH (AAAAX)",
+            "FUND A GROWTH (AAAAX)",
+        ]
+
+    def test_reinvestimento_conta_mas_nao_abre_grupo(self, lots):
+        table = lots.tables[0]
+        reinvest = next(r for r in table.rows if r["label"].startswith("Short Term"))
+        assert reinvest["row_type"] == "data"
+        assert reinvest["group"] == "FUND A GROWTH (AAAAX)"
+
+    def test_purchases_e_subtotal_e_fica_fora_da_soma(self, lots):
+        table = lots.tables[0]
+        assert all(r["row_type"] == "subtotal" for r in table.rows if r["label"] == "Purchases")
+        assert table.sum_of("market_value") == Decimal("380000.00")
+
+    def test_linha_com_o_nome_da_tabela_e_o_total_da_categoria(self, lots):
+        table = lots.tables[0]
+        category = next(r for r in table.rows if r["label"].startswith("MUTUAL FUNDS"))
+        assert category["row_type"] == "total"
+        assert table.reference_total == Decimal("380000.00")
+
+    def test_cada_grupo_e_conciliado_contra_o_seu_total(self, lots):
+        names = [c.name for c in lots.checks if c.passed]
+        assert any("FUND A GROWTH" in name for name in names)
+        assert any("FUND B INCOME" in name for name in names)
+        assert lots.failures == []
+
+
+class TestRegrasDeClassificacao:
+    def test_data_no_inicio_ou_no_fim_sai_da_descricao(self):
+        from src.tables import _leading_or_trailing_date
+
+        assert _leading_or_trailing_date("12/8 Funds Received") == ("Funds Received", "12/8")
+        assert _leading_or_trailing_date("FUND A (AAAAX) 3/10/16") == ("FUND A (AAAAX)", "3/10/16")
+        assert _leading_or_trailing_date("FUND A (AAAAX)") == ("FUND A (AAAAX)", None)
+        assert _leading_or_trailing_date("3/10/16") == ("", "3/10/16")
+
+    @pytest.mark.parametrize(
+        "label, title, expected",
+        [
+            ("Stocks", "COMMON STOCKS", True),
+            ("MUTUAL FUNDS 71.21%", "MUTUAL FUNDS", True),
+            ("Total", "COMMON STOCKS", False),
+            ("AMERICAN FUNDS INC (AFXX)", "MUTUAL FUNDS", False),
+            ("Cash, BDP, MMFs", "CASH, BANK DEPOSIT PROGRAM AND MONEY MARKET FUNDS", False),
+        ],
+    )
+    def test_rotulo_identifica_a_tabela(self, label, title, expected):
+        from src.tables import _label_matches_title
+
+        assert _label_matches_title(label, title) is expected
+
+    def test_total_de_categoria_so_e_promovido_se_dominar_as_parcelas(self):
+        """'Change in Value' num roll-forward chama-se como a tabela mas é uma parcela."""
+        from src.tables import TableResult, TableSpec, _promote_category_totals
+
+        spec = TableSpec(
+            id="t", title="CHANGE IN VALUE", account=None, pages=[1],
+            columns=[{"name": "description", "x0": 0, "x1": 10},
+                     {"name": "amount", "x0": 10, "x1": 20}],
+            header="", amount_column="amount",
+        )
+        result = TableResult(spec=spec)
+        result.rows = [
+            {"label": "Credits", "row_type": "data", "amount": Decimal("1000")},
+            {"label": "Change in Value", "row_type": "data", "amount": Decimal("10")},
+        ]
+        _promote_category_totals(result)
+        assert [row["row_type"] for row in result.rows] == ["data", "data"]
+
+        result.rows[1]["amount"] = Decimal("5000")
+        _promote_category_totals(result)
+        assert result.rows[1]["row_type"] == "total"
+
+
+class TestLeituraUnica:
+    def test_paginas_partilhadas_dao_o_mesmo_resultado(self):
+        """Ler o PDF uma vez e cortar a banda em memória não pode mudar nada."""
+        from src.lines import read_pages
+
+        layout = load_layout(LAYOUT)
+        pages, _heights = read_pages(FIXTURE)
+        shared = sweep_statement(FIXTURE, layout, pages=pages)
+        reread = sweep_statement(FIXTURE, layout)
+
+        assert [t.spec.title for t in shared.tables] == [t.spec.title for t in reread.tables]
+        assert [len(t.rows) for t in shared.tables] == [len(t.rows) for t in reread.tables]
+        assert len(shared.checks) == len(reread.checks)

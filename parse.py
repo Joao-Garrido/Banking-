@@ -23,10 +23,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from decimal import Decimal
 from pathlib import Path
 
 from src.excel import table_state, write_workbook
+from src.lines import read_pages
 from src.mapper import build_layout
 from src.pipeline import parse_statement, section_dataframe, sweep_statement
 from src.precheck import ScannedPdfError
@@ -40,17 +40,24 @@ LAYOUT_CACHE = Path(".layouts")
 
 # ------------------------------------------------------------------- layout
 
-def resolve_layout(pdf: Path, explicit: str | None, *, relayout: bool) -> tuple[dict, Path]:
-    """Layout explícito, em cache, ou gerado agora."""
+def resolve_layout(
+    pdf: Path, explicit: str | None, *, relayout: bool
+) -> tuple[dict, Path, dict | None]:
+    """Layout explícito, em cache, ou gerado agora.
+
+    Devolve também as páginas já lidas quando foi preciso ler o PDF para mapear,
+    para que a varredura não o leia outra vez.
+    """
     if explicit:
-        return load_layout(explicit), Path(explicit)
+        return load_layout(explicit), Path(explicit), None
 
     cached = LAYOUT_CACHE / f"{pdf.stem}.json"
     if cached.exists() and not relayout:
-        return load_layout(cached), cached
+        return load_layout(cached), cached, None
 
     print(f"a mapear o layout de {pdf.name} (só acontece uma vez por documento)…")
-    layout = build_layout(pdf)
+    pages = read_pages(pdf)
+    layout = build_layout(pdf, pages=pages)
     cached.parent.mkdir(parents=True, exist_ok=True)
     cached.write_text(json.dumps(layout, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"layout guardado em {cached} — revê-o se alguma tabela sair torta")
@@ -58,14 +65,14 @@ def resolve_layout(pdf: Path, explicit: str | None, *, relayout: bool) -> tuple[
         # As notas sobre as secções curadas só interessam ao modo --sections.
         if not any(note.startswith(f"{name}:") for name in ("holdings", "activity", "income", "fees")):
             print(f"  · {note}")
-    return layout, cached
+    return layout, cached, pages[0]
 
 
 # --------------------------------------------------------- modo varredura
 
 def run_sweep(pdf: Path, args) -> int:
-    layout, layout_path = resolve_layout(pdf, args.layout, relayout=args.relayout)
-    sweep = sweep_statement(pdf, layout)
+    layout, _layout_path, pages = resolve_layout(pdf, args.layout, relayout=args.relayout)
+    sweep = sweep_statement(pdf, layout, pages=pages)
 
     conciliadas = [c for c in sweep.checks if c.passed]
     print(f"\n{len(sweep.tables)} tabelas · {len(conciliadas)} conferências conciliadas · "
@@ -221,7 +228,7 @@ def _summary(result, layout: dict, checks: list[Check]) -> dict:
 
 
 def run_sections(pdf: Path, args) -> int:
-    layout, _ = resolve_layout(pdf, args.layout, relayout=args.relayout)
+    layout, _layout_path, _pages = resolve_layout(pdf, args.layout, relayout=args.relayout)
     result = parse_statement(pdf, layout, only=args.sections_only)
 
     checks = internal_checks(result, layout)

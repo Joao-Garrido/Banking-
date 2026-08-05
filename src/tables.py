@@ -20,9 +20,9 @@ from typing import Any, Iterable, Sequence
 
 from .lines import Line, group_records
 from .normalize import (
+    DATE_PATTERN,
     NormalizeError,
     is_blank,
-    looks_like_amount,
     looks_like_amount_loose,
     parse_amount_loose,
     parse_date,
@@ -47,6 +47,9 @@ TOTAL_PATTERNS = [
     r"^total\b(?!\s+purchases\s+vs)",
     r"^net\s+(credits|debits|unsettled|value\s+of)",
     r"^grand\s+total\b",
+    # Mais-valias: o total do período está no topo da tabela, sem a palavra
+    # 'total'. Sem o reconhecer, ele era somado como se fosse mais uma venda.
+    r"^(long|short)[-\s]term\s+this\s+period\b",
 ]
 
 # Somas intermédias: não entram na soma dos dados nem servem de prova.
@@ -58,8 +61,22 @@ SUBTOTAL_PATTERNS = [
     r"^cash,\s*bdp",
 ]
 
+# Rótulos que pertencem ao grupo em curso em vez de abrirem um grupo novo.
+# 'Short Term Reinvestments' é uma linha de dados como as outras, mas quem manda
+# no grupo continua a ser o título acima dela.
+CONTINUATION_LABELS = [
+    r"^(short|long)[\s-]term\s+reinvestments",
+    r"^reinvestments?\b",
+    r"^purchases\b",
+    r"^sales\b",
+    r"^total\b",
+    r"^net\b",
+]
+
 # Linhas informativas com números que não pertencem a nenhuma soma.
 INFO_PATTERNS = [
+    # Acumulado do ano: outro âmbito temporal, não é a soma das linhas do período.
+    r"^(long|short)[-\s]term\s+year\s+to\s+date\b",
     r"^total\s+purchases\s+vs",
     r"^net\s+value\s+(increase|decrease)",
     r"^cumulative\s+cash\s+distributions",
@@ -73,7 +90,6 @@ TITLE_STOPWORDS = {
     "accrued", "interest", "your", "this", "period", "date", "detail", "summary",
 }
 
-MIN_NUMERIC_LINES = 2      # menos do que isto não é tabela
 MAX_HEADER_DISTANCE = 60.0  # pt acima do primeiro registo onde procurar o header
 MAX_HEADER_CHARS = 130
 COLUMN_GAP = 8.0
@@ -98,6 +114,7 @@ def _compile(patterns: Iterable[str]) -> list[re.Pattern]:
 
 
 _TOTAL_RE = _compile(TOTAL_PATTERNS)
+_CONTINUATION_RE = _compile(CONTINUATION_LABELS)
 _SUBTOTAL_RE = _compile(SUBTOTAL_PATTERNS)
 _INFO_RE = _compile(INFO_PATTERNS)
 
@@ -163,6 +180,24 @@ _FORMATTED = re.compile(r"[.,()$]")
 
 def _is_tabular_number(text: str) -> bool:
     return bool(_FORMATTED.search(text)) and looks_like_amount_loose(text)
+
+
+def _leading_or_trailing_date(text: str) -> tuple[str, str | None]:
+    """Separa a data que o statement imprime no início ou no fim da descrição.
+
+    As datas não formam coluna própria (não têm a pontuação que distingue um
+    número de tabela), por isso caem na descrição. Tirá-las daqui dá uma coluna
+    de data utilizável e — mais importante — impede que a data de um lote passe
+    por nome da posição no agrupamento.
+    """
+    words = text.split()
+    if not words:
+        return text, None
+    if DATE_PATTERN.match(words[0]):
+        return " ".join(words[1:]), words[0]
+    if len(words) > 1 and DATE_PATTERN.match(words[-1]):
+        return " ".join(words[:-1]), words[-1]
+    return text, None
 
 
 def _is_numeric_line(line: Line) -> bool:
@@ -248,6 +283,32 @@ def _keep_numeric_bands(
 
 
 def _column_names(header_lines: Sequence[Line], bands: Sequence[tuple[float, float]]) -> list[str]:
+    """Nome de cada coluna a partir do header da tabela.
+
+    Os headers repetem-se em cada página da tabela; sem os desduplicar, uma
+    tabela de dez páginas ficava com colunas chamadas 'quantity_quantity_…'.
+    """
+    # O header repete-se em cada página da tabela, e nem sempre igual. Escolhe-se
+    # o de uma página só — a que cobre mais colunas — em vez de juntar todos:
+    # juntar dava colunas chamadas 'total_cost_total_cost'.
+    by_page: dict[int, list[Line]] = {}
+    for line in header_lines:
+        by_page.setdefault(line.page, []).append(line)
+
+    def coverage(lines: Sequence[Line]) -> int:
+        return sum(
+            1 for x0, x1 in bands if any(line.cell(x0 - 12, x1 + 12) for line in lines)
+        )
+
+    if by_page:
+        best = max(by_page, key=lambda page: (coverage(by_page[page]), -page))
+        seen: set[str] = set()
+        header_lines = [
+            line
+            for line in sorted(by_page[best], key=lambda line: line.top)
+            if not (line.text in seen or seen.add(line.text))
+        ]
+
     names: list[str] = []
     used: set[str] = set()
     for position, (x0, x1) in enumerate(bands, start=1):
@@ -454,6 +515,25 @@ def detect_tables(
 # ------------------------------------------------------------------- extração
 
 
+def _label_matches_title(label: str, title: str) -> bool:
+    """'Stocks' na folha de balanço é a tabela 'COMMON STOCKS'.
+
+    Exige-se que todas as palavras do rótulo existam no título — o contrário
+    (título contido no rótulo) deixaria 'Total' casar com tudo.
+    """
+    label_words = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", label)}
+    title_words = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", title)}
+    if not label_words or not title_words:
+        return False
+    if not label_words <= title_words:
+        return False
+    return bool(label_words - TITLE_STOPWORDS)
+
+
+def _matches(text: str, patterns: Sequence[re.Pattern]) -> bool:
+    return any(pattern.match(text.strip()) for pattern in patterns)
+
+
 def classify(label: str) -> str:
     text = label.strip()
     if not text:
@@ -484,24 +564,75 @@ def extract_table(spec: TableSpec, *, statement_year: int | None = None) -> Tabl
         for column in columns:
             raw = cells[column["name"]]
             if column["name"] == "description":
-                row["description"] = raw
+                description, date_token = _leading_or_trailing_date(raw)
+                row["description"] = description
+                row["date"] = _as_date(date_token, statement_year)
                 continue
             row[column["name"]] = _cell_value(
                 raw, spec, head.page, column["name"], result, statement_year
             )
 
+        # Classificar antes de juntar as continuações: o statement imprime a
+        # nota do título ('Asset Class: Equities') na linha a seguir ao 'Total',
+        # e juntá-la primeiro fazia o rótulo deixar de se parecer com um total.
+        row["label"] = row["description"]
+        row["row_type"] = classify(row["description"])
+
         extra = " ".join(line.text.strip() for line in continuation).strip()
         if extra:
             row["description"] = f"{row['description']} {extra}".strip()
-
-        row["row_type"] = classify(row["description"])
-        if row["row_type"] == "data" and row["description"]:
-            group_label = row["description"]
+        if row["row_type"] == "data" and row["label"] and not _matches(row["label"], _CONTINUATION_RE):
+            group_label = row["label"]
         row["group"] = group_label
         row["source_text"] = " | ".join(line.text for line in record)
         result.rows.append(row)
 
+    _promote_category_totals(result)
     return result
+
+
+def _promote_category_totals(result: TableResult) -> None:
+    """'STOCKS 19.42% … $1,384,278.01' é o total da categoria, não uma posição.
+
+    Contá-lo como posição duplicava a soma da tabela. Duas condições, ambas
+    necessárias: a linha chama-se como a tabela, e o seu valor é pelo menos tão
+    grande como qualquer outra linha de dados — um total não é menor do que as
+    parcelas. Sem a segunda condição, 'Change in Value' num quadro de
+    roll-forward passaria por total e a tabela deixaria de fechar.
+    """
+    column = result.spec.amount_column
+    if not column:
+        return
+
+    candidates = [
+        row
+        for row in result.rows
+        if row["row_type"] == "data"
+        and _label_matches_title(row["label"], result.spec.title)
+        and isinstance(row.get(column), Decimal)
+    ]
+    if not candidates:
+        return
+
+    others = [
+        abs(row[column])
+        for row in result.rows
+        if row["row_type"] == "data" and row not in candidates
+        and isinstance(row.get(column), Decimal)
+    ]
+    largest = max(others, default=Decimal("0"))
+    for row in candidates:
+        if abs(row[column]) >= largest:
+            row["row_type"] = "total"
+
+
+def _as_date(token: str | None, statement_year: int | None):
+    if not token:
+        return None
+    try:
+        return parse_date(token, year=statement_year)
+    except NormalizeError:
+        return token
 
 
 def _cell_value(
@@ -538,129 +669,199 @@ def _cell_value(
 # -------------------------------------------------------------- reconciliação
 
 
-def table_checks(result: TableResult) -> list[Check]:
-    """Σ das linhas de dados contra o total que a tabela imprime."""
-    spec = result.spec
-    column = spec.amount_column
-    if not column:
-        return []
+def _title_words(title: str) -> set[str]:
+    return {word.lower() for word in re.findall(r"[A-Za-z]{4,}", title or "")} - TITLE_STOPWORDS
 
+
+def _rounding_slack(count: int) -> Decimal:
+    """Um cêntimo por valor impresso que entra na soma.
+
+    O statement arredonda cada componente ao cêntimo: em MUTUAL FUNDS, o 'Total'
+    de uma posição difere três cêntimos da soma dos lotes que ele próprio imprime.
+    Acima desta folga a diferença deixa de ser explicável por arredondamento e
+    passa a erro. A diferença aparece sempre na folha 'Reconciliação', seja qual
+    for a classificação.
+    """
+    return Decimal("0.01") * max(count, 1)
+
+
+def _cell_problem_checks(result: TableResult) -> list[Check]:
+    return [
+        Check(
+            section=result.spec.title,
+            name="célula não interpretada",
+            passed=False,
+            extracted=problem,
+            expected="valor legível",
+            page=result.spec.pages[0],
+            detail="as somas ignoram esta célula — trata isto antes de confiar nos totais",
+        )
+        for problem in result.problems
+    ]
+
+
+def _group_checks(result: TableResult, column: str) -> list[Check]:
+    """Cada 'Total' de um título conferido contra as linhas desse título.
+
+    O statement imprime 'Total' no fim de cada posição com vários lotes. Esse
+    número é a soma daquele grupo, não da tabela: compará-lo com a tabela toda
+    dava sempre errado, e ignorá-lo deitava fora a prova mais fina que existe
+    no documento.
+    """
     checks: list[Check] = []
-    totals = result.total_rows
+    for row in result.rows:
+        if row["row_type"] != "total" or not _PLAIN_TOTAL.match(row["label"].strip()):
+            continue
+        printed = row.get(column)
+        if not isinstance(printed, Decimal):
+            continue
 
-    if not totals:
+        group = row.get("group") or ""
+        members = [
+            other
+            for other in result.rows
+            if other["row_type"] == "data" and (other.get("group") or "") == group
+        ]
+        extracted = sum(
+            (other[column] for other in members if isinstance(other.get(column), Decimal)),
+            Decimal("0"),
+        )
+        delta = abs(extracted - printed)
+        rounding = delta <= _rounding_slack(len(members))
+        detail = f"{len(members)} linha(s) sob {group[:44]!r}"
+        if rounding and delta:
+            detail += (
+                f" — diferença de {delta} compatível com o arredondamento das "
+                f"{len(members)} linhas somadas"
+            )
+
         checks.append(
-            Check(
-                section=spec.title,
-                name="total impresso",
-                passed=False,
-                extracted=result.sum_of(column),
-                expected="—",
-                page=spec.pages[0],
-                detail="a tabela não imprime total: soma extraída não é verificável aqui",
-                severity="aviso",
+            compare(
+                result.spec.title,
+                f"Σ {group[:28]} vs 'Total' impresso" if group else "Σ grupo vs 'Total' impresso",
+                extracted,
+                printed,
+                page=row["source_page"],
+                detail=detail,
+                severity="aviso" if rounding else "erro",
             )
         )
-        return checks
+    return checks
 
-    # Se existe um total geral da tabela ('TOTAL MUTUAL FUNDS'), é esse que vale;
-    # somar também os totais por grupo contaria tudo duas vezes.
-    title_words = {
-        word.lower()
-        for word in re.findall(r"[A-Za-z]{4,}", spec.title or "")
-    } - TITLE_STOPWORDS
+
+def _table_total_checks(result: TableResult, column: str) -> list[Check]:
+    """Totais da tabela inteira ('TOTAL SECURITY TRANSFERS', 'NET CREDITS/(DEBITS)')."""
+    spec = result.spec
+    totals = [
+        row
+        for row in result.total_rows
+        if not _PLAIN_TOTAL.match(row["label"].strip())
+        and isinstance(row.get(column), Decimal)
+    ]
+    if not totals:
+        return []
+
+    title_words = _title_words(spec.title)
 
     def names_the_table(label: str) -> bool:
         lowered = label.lower()
         return any(word in lowered for word in title_words)
 
-    grand = [row for row in totals if names_the_table(row["description"])]
+    # Havendo um total que se identifica com a tabela, é esse que vale; somar
+    # também os outros contaria o mesmo dinheiro duas vezes.
+    grand = [row for row in totals if names_the_table(row["label"])]
     reference = grand or totals
 
-    expected_total = Decimal("0")
-    printed_values = 0
-    for row in reference:
-        value = row.get(column)
-        if isinstance(value, Decimal):
-            expected_total += value
-            printed_values += 1
-
-    if not printed_values:
-        checks.append(
-            Check(
-                section=spec.title,
-                name="total impresso",
-                passed=False,
-                extracted=result.sum_of(column),
-                expected="—",
-                page=spec.pages[0],
-                detail=(
-                    f"a linha de total não imprime valor na coluna {column!r} "
-                    "(costuma ser '—'): nada para conferir aqui"
-                ),
-                severity="aviso",
-            )
-        )
-        return checks
-
-    result.reference_total = expected_total
+    printed = sum((row[column] for row in reference), Decimal("0"))
+    result.reference_total = printed
     extracted = result.sum_of(column)
-    delta = abs(extracted - expected_total)
+    delta = abs(extracted - printed)
 
-    # Só é erro quando sabemos que a tabela *devia* somar: o total é um 'Total'
-    # simples ou traz o nome da tabela. Um 'TOTAL ENDING VALUE' num quadro de
-    # roll-forward não é a soma das linhas acima — dizer que falhou seria tão
-    # errado como dizer que passou.
-    sum_shaped = all(
-        _PLAIN_TOTAL.match(row["description"].strip()) or names_the_table(row["description"])
-        for row in reference
-    )
-    # Cada total impresso pode ter sido arredondado ao cêntimo pelo próprio banco.
-    rounding = delta <= Decimal("0.01") * len(reference)
+    # Só é erro quando sabemos que a tabela *devia* somar. Um 'TOTAL ENDING
+    # VALUE' num quadro de roll-forward não é a soma das linhas acima — dizer
+    # que falhou seria tão errado como dizer que passou.
+    sum_shaped = all(names_the_table(row["label"]) for row in reference)
+    rounding = delta <= _rounding_slack(len(reference))
 
-    severity = "erro" if sum_shaped and not rounding else "aviso"
     detail = (
         f"{len(result.data_rows)} linhas de dados, {len(reference)} linha(s) de total: "
-        + "; ".join(row["description"][:40] for row in reference[:3])
+        + "; ".join(row["label"][:40] for row in reference[:3])
     )
     if not sum_shaped:
         detail += " — não é uma tabela de soma simples: diferença não prova erro nem acerto"
     elif rounding and delta:
         detail += f" — diferença de {delta} compatível com arredondamento do documento"
 
-    checks.append(
+    return [
         compare(
             spec.title,
             f"Σ {column} vs total impresso",
             extracted,
-            expected_total,
+            printed,
             page=spec.pages[0],
             detail=detail,
-            severity=severity,
+            severity="erro" if sum_shaped and not rounding else "aviso",
         )
-    )
+    ]
 
-    for problem in result.problems:
+
+def table_checks(result: TableResult) -> list[Check]:
+    """Conferências de uma tabela: por grupo, por tabela, e o que ficou por ler."""
+    column = result.spec.amount_column
+    if not column:
+        return []
+
+    legiveis = sum(1 for row in result.data_rows if isinstance(row.get(column), Decimal))
+    if not legiveis:
+        detail = (
+            "tabela só com linhas de total: os valores estão no livro, mas não há nada "
+            "para somar contra eles"
+            if not result.data_rows
+            else f"nenhuma linha de dados tem valor legível em {column!r} — as colunas desta "
+            "tabela não estão alinhadas; os números estão na folha, por ler à mão"
+        )
+        return [
+            Check(
+                section=result.spec.title,
+                name="soma verificável",
+                passed=False,
+                extracted=f"{len(result.data_rows)} linha(s) sem valor",
+                expected="≥1 valor legível",
+                page=result.spec.pages[0],
+                detail=detail,
+                severity="aviso",
+            )
+        ] + _cell_problem_checks(result)
+
+    checks = _group_checks(result, column) + _table_total_checks(result, column)
+
+    if not checks:
         checks.append(
             Check(
-                section=spec.title,
-                name="célula não interpretada",
+                section=result.spec.title,
+                name="total impresso",
                 passed=False,
-                extracted=problem,
-                expected="valor legível",
-                page=spec.pages[0],
-                detail="a soma acima ignora esta célula — trata isto antes de confiar no total",
+                extracted=result.sum_of(column),
+                expected="—",
+                page=result.spec.pages[0],
+                detail=(
+                    "a tabela não imprime nenhum total legível nesta coluna: o que foi "
+                    "extraído não é verificável aqui"
+                ),
+                severity="aviso",
             )
         )
-    return checks
+
+    return checks + _cell_problem_checks(result)
 
 
 def cross_checks(results: Sequence[TableResult]) -> list[Check]:
     """Tabela de resumo contra a tabela detalhada da mesma conta.
 
     O statement imprime, por conta, uma linha de resumo por categoria
-    ('MUTUAL FUNDS 71.21% ... $1,978,840.85'). Essa linha existe noutra tabela e
-    tem de bater com o detalhe — é uma prova cruzada de graça.
+    ('Mutual Funds — $1,978,840.85' na folha de balanço). Essa linha vive noutra
+    tabela e tem de bater com o detalhe — é uma prova cruzada de graça, e é a
+    única prova disponível para as tabelas que não imprimem total nenhum.
     """
     by_account: dict[str | None, list[TableResult]] = {}
     for result in results:
@@ -668,35 +869,54 @@ def cross_checks(results: Sequence[TableResult]) -> list[Check]:
 
     checks: list[Check] = []
     for account, group in by_account.items():
-        detail_by_title = {}
-        for result in group:
-            column = result.spec.amount_column
-            if column and result.data_rows:
-                detail_by_title.setdefault(result.spec.title.strip().lower(), result)
+        detailed = [
+            result
+            for result in group
+            if result.spec.amount_column and result.data_rows
+        ]
 
         for result in group:
             column = result.spec.amount_column
             if not column:
                 continue
             for row in result.rows:
-                label = (row.get("description") or "").strip().lower()
-                target = detail_by_title.get(label)
-                if target is None or target is result:
-                    continue
-                value = row.get(column)
+                label = (row.get("label") or row.get("description") or "").strip()
+                targets = [
+                    target
+                    for target in detailed
+                    if target is not result and _label_matches_title(label, target.spec.title)
+                ]
+                if len(targets) != 1:
+                    continue  # ambíguo: preferimos não afirmar nada
+
+                target = targets[0]
+                # A comparação tem de ser da mesma grandeza: o valor de mercado
+                # do resumo contra o valor de mercado do detalhe, nunca contra o
+                # custo de aquisição que está na coluna ao lado.
+                value = row.get(target.spec.amount_column)
                 if not isinstance(value, Decimal):
                     continue
+                extracted = target.sum_of(target.spec.amount_column)
+                delta = abs(extracted - value)
+                rows_summed = len(target.data_rows)
+                detail = (
+                    f"resumo {label!r} em {result.spec.title[:34]!r} p.{row['source_page']} "
+                    f"vs {rows_summed} linhas do detalhe da conta {account}"
+                )
+                if delta and delta <= _rounding_slack(rows_summed):
+                    detail += (
+                        f" — diferença de {delta} compatível com o arredondamento das "
+                        f"{rows_summed} linhas somadas"
+                    )
                 checks.append(
                     compare(
                         target.spec.title,
                         "detalhe vs linha de resumo",
-                        target.sum_of(target.spec.amount_column),
+                        extracted,
                         value,
                         page=row["source_page"],
-                        detail=(
-                            f"resumo em {result.spec.title!r} p.{row['source_page']} "
-                            f"vs detalhe da conta {account}"
-                        ),
+                        detail=detail,
+                        tolerance=_rounding_slack(rows_summed),
                         severity="aviso",
                     )
                 )

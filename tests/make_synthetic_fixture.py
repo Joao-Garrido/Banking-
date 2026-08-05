@@ -210,5 +210,55 @@ def build(path: Path = FIXTURE, *, holdings_total: str | None = None) -> Path:
     return path
 
 
+# ------------------------------------------------------- fixture de lotes
+# Reproduz a estrutura que o statement real usa nas posições: cada título tem
+# vários lotes, um subtotal 'Purchases', reinvestimentos, um 'Total' do título,
+# e no fim uma linha com o nome da categoria que é o total da tabela.
+LOTS = [
+    ("FUND A GROWTH (AAAAX)", [("3/10/16", "100,000.00"), ("4/11/16", "50,000.00")],
+     "150,000.00", "5,000.00", "155,000.00"),
+    ("FUND B INCOME (BBBBX)", [("6/10/16", "200,000.00"), ("6/20/16", "25,000.00")],
+     "225,000.00", None, "225,000.00"),
+]
+LOTS_CATEGORY_TOTAL = "380,000.00"
+
+X_LOT_DATE = 250.0
+X_LOT_VALUE = 520.0
+
+
+def build_lots(path: Path) -> Path:
+    """Statement sintético com lotes, subtotais e total de categoria."""
+    total = sum(_decimal(row[4]) for row in LOTS)
+    assert total == _decimal(LOTS_CATEGORY_TOTAL), total
+    for _, lots, purchases, reinvest, group_total in LOTS:
+        parts = sum(_decimal(value) for _, value in lots)
+        assert parts == _decimal(purchases), parts
+        assert parts + (_decimal(reinvest) if reinvest else 0) == _decimal(group_total)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    painter = Painter(doc, total_pages=1)
+    painter.new_page()
+    painter.title("MUTUAL FUNDS")
+    painter.header_row([(X_DESC, "Security Description"), (X_LOT_DATE, "Trade Date"),
+                        (X_LOT_VALUE, "Market Value")])
+
+    for name, lots, purchases, reinvest, group_total in LOTS:
+        first_date, first_value = lots[0]
+        painter.row([(None, name), (X_LOT_DATE, first_date), (X_LOT_VALUE, first_value)])
+        for date, value in lots[1:]:
+            painter.row([(X_LOT_DATE, date), (X_LOT_VALUE, value)])
+        painter.row([(None, "Purchases"), (X_LOT_VALUE, purchases)])
+        if reinvest:
+            painter.row([(None, "Short Term Reinvestments"), (X_LOT_VALUE, reinvest)])
+        painter.row([(None, "Total"), (X_LOT_VALUE, group_total)])
+        painter.gap()
+
+    painter.row([(None, "MUTUAL FUNDS 100.00%"), (X_LOT_VALUE, LOTS_CATEGORY_TOTAL)], font=BOLD)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
 if __name__ == "__main__":
     print(f"escrito: {build()}")

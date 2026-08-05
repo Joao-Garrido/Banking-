@@ -12,7 +12,7 @@ from typing import Sequence
 
 import pandas as pd
 
-from .lines import Line, extract_lines
+from .lines import Line, extract_lines, lines_in_band
 from .reconcile import Check
 from .precheck import TextLayerReport, assert_text_layer
 from .router import (
@@ -118,21 +118,33 @@ class SweepResult:
         return [check for check in self.checks if not check.passed and not check.fatal]
 
 
-def sweep_statement(pdf_path: str | Path, layout: dict, *, skip_precheck: bool = False):
-    """PDF + layout -> todas as tabelas extraídas e reconciliadas."""
+def sweep_statement(
+    pdf_path: str | Path,
+    layout: dict,
+    *,
+    skip_precheck: bool = False,
+    pages: dict[int, list[Line]] | None = None,
+):
+    """PDF + layout -> todas as tabelas extraídas e reconciliadas.
+
+    `pages` são as linhas já lidas (sem corte de banda), para não reler o PDF.
+    """
     from .tables import cross_checks, detect_tables, extract_table, table_checks
 
     path = Path(pdf_path)
     report = None if skip_precheck else assert_text_layer(path)
 
-    lines = extract_lines(
-        path,
-        body_band=layout.get("body_band"),
-        y_tolerance=layout.get("y_tolerance", 2.5),
-    )
-    by_page: dict[int, list[Line]] = {}
-    for line in lines:
-        by_page.setdefault(line.page, []).append(line)
+    if pages is None:
+        lines = extract_lines(
+            path,
+            body_band=layout.get("body_band"),
+            y_tolerance=layout.get("y_tolerance", 2.5),
+        )
+        by_page: dict[int, list[Line]] = {}
+        for line in lines:
+            by_page.setdefault(line.page, []).append(line)
+    else:
+        by_page = lines_in_band(pages, layout.get("body_band"))
 
     account_of_page = {page: account_for_page(layout, page) for page in by_page}
     notes: list[str] = []

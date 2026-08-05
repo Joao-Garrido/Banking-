@@ -23,7 +23,7 @@ from typing import Iterable, Sequence
 
 import pdfplumber
 
-from .lines import Line, Word, group_words_into_lines, words_from_page
+from .lines import Line, Word, read_pages, words_from_page
 from .normalize import looks_like_amount
 from .precheck import assert_text_layer
 from .router import LAYOUT_VERSION
@@ -84,18 +84,13 @@ def _snake(text: str) -> str:
 
 
 def _page_lines(pdf_path: Path) -> tuple[dict[int, list[Line]], dict[int, float]]:
-    per_page: dict[int, list[Line]] = {}
-    heights: dict[int, float] = {}
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for index, page in enumerate(pdf.pages, start=1):
-            words = words_from_page(page, index)
-            per_page[index] = group_words_into_lines(words)
-            heights[index] = float(page.height)
-    return per_page, heights
+    return read_pages(pdf_path)
 
 
 def detect_body_band(
-    per_page: dict[int, list[Line]], heights: dict[int, float]
+    per_page: dict[int, list[Line]],
+    heights: dict[int, float],
+    account_ids: Sequence[str] = (),
 ) -> tuple[dict, list[str]]:
     """Banda y do corpo: abaixo do header repetido, acima do footer repetido.
 
@@ -119,6 +114,16 @@ def detect_body_band(
     for page, lines in per_page.items():
         height = heights[page]
         for line in lines:
+            # A linha com o número da conta é cabeçalho de página mesmo quando
+            # só se repete nas páginas daquela conta.
+            is_account_header = any(account_id in line.text for account_id in account_ids)
+            if is_account_header and line.top < height * 0.25:
+                # Pode estar mais abaixo do que o cabeçalho comum, mas continua a
+                # ser mobília da página: se entrar no corpo, o nome do titular
+                # acaba colado aos nomes das colunas.
+                header_bottom = max(header_bottom, line.bottom)
+                classified.add("header: linha com o número da conta")
+                continue
             if _fingerprint(line.text) not in repeated:
                 continue
             if line.bottom < height * HEADER_ZONE:
@@ -378,15 +383,19 @@ def build_layout(
     pdf_path: str | Path,
     *,
     patterns: dict[str, list[str]] | None = None,
+    pages: tuple[dict[int, list[Line]], dict[int, float]] | None = None,
 ) -> dict:
+    """`pages` evita reler o PDF quando quem chama já o leu."""
     path = Path(pdf_path)
     assert_text_layer(path)
 
-    per_page, heights = _page_lines(path)
-    body_band, notes = detect_body_band(per_page, heights)
+    per_page, heights = pages if pages is not None else _page_lines(path)
+    accounts, notes = detect_accounts(per_page, heights)
 
-    accounts, account_notes = detect_accounts(per_page, heights)
-    notes.extend(account_notes)
+    body_band, band_notes = detect_body_band(
+        per_page, heights, [account["id"] for account in accounts]
+    )
+    notes = band_notes + notes
 
     statement_year, year_notes = detect_statement_year(per_page)
     notes.extend(year_notes)
