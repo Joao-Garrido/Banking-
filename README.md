@@ -16,12 +16,33 @@ aparece marcado como *não verificável* — nunca como certo.
 
 ---
 
-## Setup
+## Começar
+
+Requer Python 3.10 ou superior.
 
 ```bash
+git clone https://github.com/Joao-Garrido/Banking-.git
+cd Banking-
+
+python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pytest                      # 166 testes
+
+pytest                                  # 166 testes; 1 salta (precisa de um statement real)
+python parse.py tests/fixtures/synthetic_statement.pdf   # experimenta no exemplo incluído
 ```
+
+O último comando escreve `out/synthetic_statement.xlsx` e mostra
+`Sem contradições entre o extraído e os totais impressos` — é assim que se
+confirma que a instalação está boa antes de apontar para um documento a sério.
+
+Depois, o teu statement:
+
+```bash
+python parse.py /caminho/para/statement.pdf
+```
+
+A primeira passagem de cada documento mapeia o layout (~15 s numas 50 páginas) e
+guarda-o em `.layouts/`; as seguintes reaproveitam-no.
 
 ## O que sai
 
