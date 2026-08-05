@@ -29,6 +29,14 @@ class Check:
     expected: Any
     page: int | None = None
     detail: str = ""
+    # 'erro' faz o comando falhar; 'aviso' é aquilo que não conseguimos provar.
+    # A diferença importa: não-verificável não é o mesmo que errado, e chamar
+    # certo àquilo que não foi provado era o erro que este projeto evita.
+    severity: str = "erro"
+
+    @property
+    def fatal(self) -> bool:
+        return not self.passed and self.severity == "erro"
 
     @property
     def delta(self):
@@ -39,7 +47,7 @@ class Check:
         return None
 
     def format(self) -> str:
-        status = "PASS" if self.passed else "FAIL"
+        status = "PASS" if self.passed else ("FAIL" if self.severity == "erro" else "AVISO")
         where = f" p.{self.page}" if self.page else ""
         line = f"  [{status}] {self.section}{where} · {self.name}: extraído={self.extracted} esperado={self.expected}"
         delta = self.delta
@@ -59,6 +67,7 @@ def compare(
     page: int | None = None,
     detail: str = "",
     tolerance: Decimal = TOLERANCE,
+    severity: str = "erro",
 ) -> Check:
     if extracted is None or expected is None:
         return Check(
@@ -69,9 +78,10 @@ def compare(
             expected=expected,
             page=page,
             detail=detail or "valor em falta — nada para comparar",
+            severity=severity,
         )
     passed = abs(extracted - expected) <= tolerance
-    return Check(section, name, passed, extracted, expected, page, detail)
+    return Check(section, name, passed, extracted, expected, page, detail, severity)
 
 
 def compare_count(

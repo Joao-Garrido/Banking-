@@ -131,7 +131,8 @@ class TestEntrypoint:
 
         out = tmp_path / "out"
         code = entrypoint.main(
-            [str(FIXTURE), "--layout", str(LAYOUT), "--expected", str(EXPECTED), "--out", str(out)]
+            [str(FIXTURE), "--sections", "--layout", str(LAYOUT),
+             "--expected", str(EXPECTED), "--out", str(out)]
         )
         assert code == 0
         for name in ("holdings", "activity", "income", "fees"):
@@ -153,7 +154,8 @@ class TestEntrypoint:
 
         out = tmp_path / "out"
         code = entrypoint.main(
-            [str(FIXTURE), "--layout", str(LAYOUT), "--expected", str(tampered), "--out", str(out)]
+            [str(FIXTURE), "--sections", "--layout", str(LAYOUT),
+             "--expected", str(tampered), "--out", str(out)]
         )
         assert code == 1
         assert not out.exists()
@@ -169,7 +171,7 @@ class TestEntrypoint:
 
         out = tmp_path / "out"
         code = entrypoint.main(
-            [str(FIXTURE), "--layout", str(LAYOUT), "--expected", str(tampered),
+            [str(FIXTURE), "--sections", "--layout", str(LAYOUT), "--expected", str(tampered),
              "--out", str(out), "--force"]
         )
         assert code == 1

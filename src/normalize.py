@@ -13,6 +13,9 @@ from decimal import Decimal, InvalidOperation
 
 __all__ = [
     "NormalizeError",
+    "strip_marker",
+    "looks_like_amount_loose",
+    "parse_amount_loose",
     "parse_amount",
     "parse_quantity",
     "parse_percent",
@@ -247,6 +250,41 @@ def detect_currency(text: str | None) -> str | None:
             return code
     _, currency = _strip_currency(s)
     return currency
+
+
+# Marcadores colados ao número nas tabelas de posições: '$5,958.99ST', '(17.53)LT'.
+_TRAILING_MARKER = re.compile(r"(?<=[\d)])\s*[A-Za-z]{1,2}$")
+
+
+def strip_marker(text: str) -> tuple[str, str | None]:
+    """Separa o marcador de curto/longo prazo colado ao valor."""
+    match = _TRAILING_MARKER.search(text.strip())
+    if not match:
+        return text, None
+    return text[: match.start()].strip(), match.group(0).strip()
+
+
+def looks_like_amount_loose(text: str | None) -> bool:
+    """looks_like_amount, tolerando o marcador colado ('$5,958.99ST')."""
+    if looks_like_amount(text):
+        return True
+    if is_blank(text):
+        return False
+    body, marker = strip_marker(str(text))
+    return bool(marker) and looks_like_amount(body)
+
+
+def parse_amount_loose(text: str | None):
+    """Devolve (valor, marcador). Levanta NormalizeError como o parse_amount."""
+    if is_blank(text):
+        raise NormalizeError(f"célula vazia onde era esperado um valor: {text!r}")
+    try:
+        return parse_amount(text), None
+    except NormalizeError:
+        body, marker = strip_marker(str(text))
+        if not marker:
+            raise
+        return parse_amount(body), marker
 
 
 def looks_like_amount(text: str | None) -> bool:

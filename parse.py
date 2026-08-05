@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Entrypoint.
 
-    python parse.py statement.pdf --out out/
+    python parse.py statement.pdf
 
-Escreve um CSV por secção e um summary.json com os totais reconciliados.
-Se alguma reconciliação falhar, sai com código != 0 e não escreve nada — a não
-ser que se passe --force, e nesse caso os ficheiros levam o sufixo .PARTIAL e o
-aviso vai para stderr.
+Faz tudo: verifica que o PDF tem texto, mapeia o layout (contas, banda do corpo,
+ano do período), varre todas as tabelas do documento, reconcilia cada uma contra
+os totais que ela própria imprime, e escreve um Excel em `out/`.
+
+O layout é gerado automaticamente na primeira vez e guardado em `.layouts/`;
+nas seguintes é reutilizado. `--relayout` força voltar a gerá-lo.
+
+Se alguma reconciliação falhar, o ficheiro sai com o sufixo `.PARTIAL` e o
+comando devolve código ≠ 0. Com `--strict`, não escreve nada nesse caso.
+
+Modo alternativo `--sections`: usa as secções curadas do layout (holdings,
+activity, income, fees) e escreve CSV + summary.json. É o caminho da Fase 3 do
+roadmap, para quando uma secção já tem gabarito próprio em tests/expected.json.
 """
 
 from __future__ import annotations
@@ -17,13 +26,107 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
-from src.pipeline import parse_statement, section_dataframe
+from src.excel import table_state, write_workbook
+from src.mapper import build_layout
+from src.pipeline import parse_statement, section_dataframe, sweep_statement
 from src.precheck import ScannedPdfError
 from src.reconcile import Check, compare
 from src.router import LayoutError, MissingSectionError, load_layout
 from src.sections import module_for
 from src.sections.base import SectionError, SectionResult
 
+LAYOUT_CACHE = Path(".layouts")
+
+
+# ------------------------------------------------------------------- layout
+
+def resolve_layout(pdf: Path, explicit: str | None, *, relayout: bool) -> tuple[dict, Path]:
+    """Layout explícito, em cache, ou gerado agora."""
+    if explicit:
+        return load_layout(explicit), Path(explicit)
+
+    cached = LAYOUT_CACHE / f"{pdf.stem}.json"
+    if cached.exists() and not relayout:
+        return load_layout(cached), cached
+
+    print(f"a mapear o layout de {pdf.name} (só acontece uma vez por documento)…")
+    layout = build_layout(pdf)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text(json.dumps(layout, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"layout guardado em {cached} — revê-o se alguma tabela sair torta")
+    for note in layout.get("_review", []):
+        # As notas sobre as secções curadas só interessam ao modo --sections.
+        if not any(note.startswith(f"{name}:") for name in ("holdings", "activity", "income", "fees")):
+            print(f"  · {note}")
+    return layout, cached
+
+
+# --------------------------------------------------------- modo varredura
+
+def run_sweep(pdf: Path, args) -> int:
+    layout, layout_path = resolve_layout(pdf, args.layout, relayout=args.relayout)
+    sweep = sweep_statement(pdf, layout)
+
+    conciliadas = [c for c in sweep.checks if c.passed]
+    print(f"\n{len(sweep.tables)} tabelas · {len(conciliadas)} conferências conciliadas · "
+          f"{len(sweep.failures)} falhas · {len(sweep.warnings)} avisos")
+
+    for check in sweep.failures:
+        print(check.format())
+
+    if sweep.failures and args.strict:
+        print("\nFALHA: --strict e há reconciliações por bater. Nada foi escrito.", file=sys.stderr)
+        return 1
+
+    suffix = ".PARTIAL" if sweep.failures else ""
+    destination = Path(args.out) / f"{pdf.stem}{suffix}.xlsx"
+    write_workbook(
+        destination,
+        pdf=str(pdf),
+        layout=layout,
+        tables=sweep.tables,
+        checks=sweep.checks,
+        include_diagnostics=not args.no_diagnostics,
+    )
+    print(f"\nescrito: {destination}")
+
+    if args.csv:
+        for result in sweep.tables:
+            path = Path(args.out) / "csv" / f"{result.spec.id}.csv"
+            _write_table_csv(path, result)
+        print(f"escrito: {Path(args.out) / 'csv'}/ ({len(sweep.tables)} ficheiros)")
+
+    from collections import Counter
+
+    estados = Counter(table_state(result.spec, sweep.checks) for result in sweep.tables)
+    print("tabelas: " + " · ".join(f"{estado} {contagem}" for estado, contagem in estados.most_common()))
+
+    if sweep.failures:
+        print(
+            f"\nAVISO: saída marcada .PARTIAL — {len(sweep.failures)} reconciliações falharam. "
+            "Vê a folha 'Reconciliação' antes de usar estes números.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Sem contradições entre o extraído e os totais impressos.")
+    return 0
+
+
+def _write_table_csv(path: Path, result) -> None:
+    import csv
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["row_type", "group", "description"]
+    columns += [c["name"] for c in result.spec.columns if c["name"] != "description"]
+    columns += ["source_page", "account"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(result.rows)
+
+
+# ------------------------------------------------------------- modo secções
 
 def internal_checks(result, layout: dict) -> list[Check]:
     """Conferências que não precisam de gabarito: extraído vs impresso no PDF."""
@@ -117,42 +220,20 @@ def _summary(result, layout: dict, checks: list[Check]) -> dict:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Parser de statements Morgan Stanley.")
-    parser.add_argument("pdf")
-    parser.add_argument("--out", default="out", help="diretório de saída (default: out/)")
-    parser.add_argument("--layout", default="layout.json")
-    parser.add_argument("--expected", default="tests/expected.json",
-                        help="gabarito; se o statement lá estiver, a reconciliação completa corre")
-    parser.add_argument("--section", action="append", dest="sections")
-    parser.add_argument("--force", action="store_true",
-                        help="escreve mesmo com reconciliação falhada (ficheiros .PARTIAL)")
-    args = parser.parse_args(argv)
-
-    pdf = Path(args.pdf)
-    out_dir = Path(args.out)
-
-    try:
-        layout = load_layout(args.layout)
-        result = parse_statement(pdf, layout, only=args.sections)
-    except (LayoutError, ScannedPdfError, SectionError, MissingSectionError, ValueError,
-            FileNotFoundError, json.JSONDecodeError) as exc:
-        print(f"ERRO: {exc}", file=sys.stderr)
-        return 2
+def run_sections(pdf: Path, args) -> int:
+    layout, _ = resolve_layout(pdf, args.layout, relayout=args.relayout)
+    result = parse_statement(pdf, layout, only=args.sections_only)
 
     checks = internal_checks(result, layout)
     expected_path = Path(args.expected)
     if expected_path.exists():
-        try:
-            checks.extend(gabarito_checks(result, layout, expected_path, pdf))
-        except (json.JSONDecodeError, KeyError) as exc:
-            print(f"ERRO ao ler {expected_path}: {exc}", file=sys.stderr)
-            return 2
+        checks.extend(gabarito_checks(result, layout, expected_path, pdf))
 
-    failures = [c for c in checks if not c.passed]
+    failures = [c for c in checks if c.fatal]
     for check in checks:
         print(check.format())
 
+    out_dir = Path(args.out)
     if failures and not args.force:
         print(
             f"\nFALHA: {len(failures)} de {len(checks)} reconciliações não bateram. "
@@ -181,14 +262,49 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         print(
-            f"\nAVISO: saída marcada .PARTIAL — {len(failures)} reconciliações falharam. "
-            "Não uses estes CSV como se estivessem certos.",
+            f"\nAVISO: saída marcada .PARTIAL — {len(failures)} reconciliações falharam.",
             file=sys.stderr,
         )
         return 1
 
     print(f"\nOK: {len(checks)} reconciliações conciliadas.")
     return 0
+
+
+# ------------------------------------------------------------------------ CLI
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Statement Morgan Stanley -> Excel reconciliado.",
+    )
+    parser.add_argument("pdf")
+    parser.add_argument("--out", default="out", help="diretório de saída (default: out/)")
+    parser.add_argument("--layout", help="layout.json explícito (default: gerado e cacheado)")
+    parser.add_argument("--relayout", action="store_true", help="volta a mapear o layout")
+    parser.add_argument("--csv", action="store_true", help="escreve também um CSV por tabela")
+    parser.add_argument("--strict", action="store_true",
+                        help="não escreve nada se alguma reconciliação falhar")
+    parser.add_argument("--no-diagnostics", action="store_true",
+                        help="omite a coluna com o texto original de cada linha")
+    parser.add_argument("--sections", action="store_true",
+                        help="modo secções curadas (CSV + summary.json) em vez da varredura")
+    parser.add_argument("--section", action="append", dest="sections_only",
+                        help="no modo --sections, limita a uma secção")
+    parser.add_argument("--expected", default="tests/expected.json",
+                        help="gabarito usado no modo --sections")
+    parser.add_argument("--force", action="store_true",
+                        help="no modo --sections, escreve mesmo com falhas (.PARTIAL)")
+    args = parser.parse_args(argv)
+
+    pdf = Path(args.pdf)
+    try:
+        if args.sections or args.sections_only:
+            return run_sections(pdf, args)
+        return run_sweep(pdf, args)
+    except (LayoutError, ScannedPdfError, SectionError, MissingSectionError, ValueError,
+            FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

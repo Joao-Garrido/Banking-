@@ -13,6 +13,7 @@ from typing import Sequence
 import pandas as pd
 
 from .lines import Line, extract_lines
+from .reconcile import Check
 from .precheck import TextLayerReport, assert_text_layer
 from .router import (
     account_for_page,
@@ -97,3 +98,62 @@ def section_dataframe(result: SectionResult, *, drop_diagnostics: bool = False) 
     if drop_diagnostics:
         frame = frame.drop(columns=[c for c in DISPLAY_DROP if c in frame.columns])
     return frame
+
+
+@dataclass
+class SweepResult:
+    """Varredura automática: todas as tabelas do documento, com as conferências."""
+
+    pdf: str
+    tables: list = field(default_factory=list)
+    checks: list = field(default_factory=list)
+    text_layer: TextLayerReport | None = None
+
+    @property
+    def failures(self) -> list:
+        return [check for check in self.checks if check.fatal]
+
+    @property
+    def warnings(self) -> list:
+        return [check for check in self.checks if not check.passed and not check.fatal]
+
+
+def sweep_statement(pdf_path: str | Path, layout: dict, *, skip_precheck: bool = False):
+    """PDF + layout -> todas as tabelas extraídas e reconciliadas."""
+    from .tables import cross_checks, detect_tables, extract_table, table_checks
+
+    path = Path(pdf_path)
+    report = None if skip_precheck else assert_text_layer(path)
+
+    lines = extract_lines(
+        path,
+        body_band=layout.get("body_band"),
+        y_tolerance=layout.get("y_tolerance", 2.5),
+    )
+    by_page: dict[int, list[Line]] = {}
+    for line in lines:
+        by_page.setdefault(line.page, []).append(line)
+
+    account_of_page = {page: account_for_page(layout, page) for page in by_page}
+    notes: list[str] = []
+    specs = detect_tables(by_page, account_of_page=account_of_page, notes=notes)
+
+    year = layout.get("statement_year")
+    results = [extract_table(spec, statement_year=year) for spec in specs]
+
+    checks = [check for result in results for check in table_checks(result)]
+    checks.extend(cross_checks(results))
+    checks.extend(
+        Check(
+            section="documento",
+            name="bloco ignorado",
+            passed=False,
+            extracted=note,
+            expected="—",
+            detail="conteúdo que a varredura não conseguiu tratar como tabela",
+            severity="aviso",
+        )
+        for note in notes
+    )
+
+    return SweepResult(pdf=str(path), tables=results, checks=checks, text_layer=report)

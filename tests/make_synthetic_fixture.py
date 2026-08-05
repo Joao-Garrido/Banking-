@@ -137,8 +137,11 @@ class Painter:
         self.y += amount
 
 
-def build(path: Path = FIXTURE) -> Path:
+def build(path: Path = FIXTURE, *, holdings_total: str | None = None) -> Path:
+    """holdings_total permite escrever de propósito um total que não fecha —
+    é assim que se testa que o arnês sabe apanhar um documento inconsistente."""
     _self_check()
+    printed_holdings_total = holdings_total or HOLDINGS_TOTAL
     path.parent.mkdir(parents=True, exist_ok=True)
 
     doc = fitz.open()
@@ -146,7 +149,7 @@ def build(path: Path = FIXTURE) -> Path:
 
     # ------------------------------------------------------------- p1: sumário
     painter.new_page()
-    painter.title("Account Summary")
+    painter.title("ACCOUNT SUMMARY")
     painter.row([(None, "Beginning Value"), (X_VALUE, BEGINNING_VALUE)])
     painter.row([(None, "Net Flows"), (X_VALUE, ACTIVITY_TOTAL)])
     painter.row([(None, "Change in Market Value"), (X_VALUE, MARKET_CHANGE)])
@@ -155,7 +158,7 @@ def build(path: Path = FIXTURE) -> Path:
 
     # -------------------------------------------------- p2-p3: holdings partido
     painter.new_page()
-    painter.title("Portfolio Holdings")
+    painter.title("PORTFOLIO HOLDINGS")
     painter.header_row([(X_DESC, "Description"), (X_QTY, "Quantity"), (X_PRICE, "Price"),
                         (X_VALUE, "Market Value")])
     for description, continuation, quantity, price, value in HOLDINGS[:4]:
@@ -171,11 +174,11 @@ def build(path: Path = FIXTURE) -> Path:
         if continuation:
             painter.row([(None, "   " + continuation)])
     painter.gap()
-    painter.row([(None, "Total Holdings"), (X_VALUE, HOLDINGS_TOTAL)], font=BOLD)
+    painter.row([(None, "Total Holdings"), (X_VALUE, printed_holdings_total)], font=BOLD)
 
     # ------------------------------------------------------------- p4: activity
     painter.new_page()
-    painter.title("Account Activity")
+    painter.title("ACCOUNT ACTIVITY")
     painter.header_row([(X_DESC, "Date  Description"), (X_VALUE, "Amount")])
     for date, description, continuation, amount in ACTIVITY:
         painter.row([(None, f"{date}  {description}"), (X_VALUE, amount)])
@@ -186,7 +189,7 @@ def build(path: Path = FIXTURE) -> Path:
 
     # --------------------------------------------------------------- p5: income
     painter.new_page()
-    painter.title("Income")
+    painter.title("INCOME")
     painter.header_row([(X_DESC, "Date  Description"), (X_VALUE, "Amount")])
     for date, description, _, amount in INCOME:
         painter.row([(None, f"{date}  {description}"), (X_VALUE, amount)])
@@ -195,7 +198,7 @@ def build(path: Path = FIXTURE) -> Path:
 
     # ----------------------------------------------------------------- p6: fees
     painter.new_page()
-    painter.title("Fees and Charges")
+    painter.title("FEES AND CHARGES")
     painter.header_row([(X_DESC, "Date  Description"), (X_VALUE, "Amount")])
     for date, description, _, amount in FEES:
         painter.row([(None, f"{date}  {description}"), (X_VALUE, amount)])
