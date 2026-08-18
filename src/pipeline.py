@@ -134,6 +134,7 @@ def sweep_statement(
         detect_tables,
         extract_table,
         period_hint,
+        refine_amount_column,
         table_checks,
     )
 
@@ -163,6 +164,11 @@ def sweep_statement(
 
     year = layout.get("statement_year")
     results = [extract_table(spec, statement_year=year) for spec in specs]
+
+    for result in results:
+        nota = refine_amount_column(result)
+        if nota:
+            notes.append(nota)
 
     checks = [check for result in results for check in table_checks(result)]
     checks.extend(cross_checks(results))

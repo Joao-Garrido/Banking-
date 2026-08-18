@@ -102,7 +102,13 @@ _NON_WORD = re.compile(r"[^a-z0-9]+")
 # ao meio; o statement escreve os seus títulos em maiúsculas, e é isso que vale.
 _HEADING = re.compile(r"^[A-Z][A-Z0-9 &/,.'()\-]{3,70}(?:\s*\([^)]{0,60}\))?$")
 _CONTINUED = re.compile(r"\s*\(CONTINUED\)\s*$", re.IGNORECASE)
-_PLAIN_TOTAL = re.compile(r"^totals?$", re.IGNORECASE)
+# 'Total', mas também 'Total 21,477.613': a quantidade do título cai na
+# descrição quando não forma coluna própria. O que distingue este do total da
+# tabela ('Total Holdings') é não haver mais palavras depois de 'Total'.
+_PLAIN_TOTAL = re.compile(r"^totals?(?:\s+[\d.,()%$+-]+)*$", re.IGNORECASE)
+# Rótulo sem os números que o documento cola ao lado ('CORPORATE FIXED INCOME
+# 10.16%' e 'TOTAL CORPORATE FIXED INCOME' falam da mesma coisa).
+_SO_PALAVRAS = re.compile(r"[A-Za-z][A-Za-z&/'-]*")
 _PERCENT = re.compile(r"^\(?-?[\d,]+(\.\d+)?\)?\s*%$")
 
 
@@ -129,12 +135,17 @@ class TableSpec:
     columns: list[dict]
     header: str
     amount_column: str | None
+    # Títulos por cima do bloco, do mais geral ao mais específico:
+    # ('GOVERNMENT SECURITIES', 'TREASURY SECURITIES'). A linha que fecha a
+    # secção pode trazer qualquer um dos dois.
+    section_path: tuple[str, ...] = ()
     lines: list[Line] = field(default_factory=list, repr=False)
 
     def to_json(self) -> dict:
         return {
             "id": self.id,
             "title": self.title,
+            "section_path": list(self.section_path),
             "account": self.account,
             "pages": self.pages,
             "header": self.header,
@@ -184,6 +195,17 @@ _FORMATTED = re.compile(r"[.,()$]")
 
 def _is_tabular_number(text: str) -> bool:
     return bool(_FORMATTED.search(text)) and looks_like_amount_loose(text)
+
+
+def _is_column_token(text: str) -> bool:
+    """O que ocupa uma célula de coluna: um número, ou a marca de 'sem valor'.
+
+    O statement escreve '—' ou 'N/A' onde não há valor. Se isso não contasse
+    para desenhar as colunas, uma coluna cheia de travessões desaparecia e o
+    travessão colava-se ao número da coluna ao lado — que era o que acontecia
+    na tabela de caixa.
+    """
+    return _is_tabular_number(text) or (bool(text.strip()) and is_blank(text))
 
 
 def _leading_or_trailing_date(text: str) -> tuple[str, list[str]]:
@@ -242,7 +264,7 @@ def _numeric_bands(lines: Sequence[Line], *, min_words: int = 2) -> list[tuple[f
     coluna. Blocos de uma só linha (um registo isolado entre notas) baixam para
     1: preferimos uma coluna a mais a perder o registo.
     """
-    words = [w for line in lines for w in line.words if _is_tabular_number(w.text)]
+    words = [w for line in lines for w in line.words if _is_column_token(w.text)]
     clusters: list[list] = []
     for word in sorted(words, key=lambda w: w.x1):
         if clusters and word.x1 - clusters[-1][-1].x1 <= COLUMN_GAP:
@@ -285,7 +307,7 @@ def _keep_numeric_bands(
             if not cell:
                 continue
             filled += 1
-            if _is_tabular_number(cell):
+            if _is_column_token(cell):
                 numeric += 1
         if filled and numeric / filled >= 0.6:
             kept.append((x0, x1))
@@ -390,11 +412,11 @@ def _blocks_of_page(
     lines: Sequence[Line], left_margin: float = 0.0, median_size: float = 0.0
 ) -> list[tuple[list[Line], list[Line], str | None]]:
     """Divide a página em (linhas do bloco, linhas de header, título)."""
-    blocks: list[tuple[list[Line], list[Line], str | None]] = []
+    blocks: list[tuple[list[Line], list[Line], tuple[str, ...]]] = []
     current: list[Line] = []
     gap: list[Line] = []
-    title: str | None = None
-    pending_title: str | None = None
+    title: tuple[str, ...] = ()
+    pending_title: tuple[str, ...] = ()
 
     def flush() -> None:
         """Fecha o bloco. Basta uma linha numérica: um registo isolado entre
@@ -407,9 +429,9 @@ def _blocks_of_page(
 
     for line in lines:
         if _is_numeric_line(line):
-            if pending_title is not None and not current:
+            if pending_title and not current:
                 title = pending_title
-                pending_title = None
+                pending_title = ()
             current.extend(gap)
             gap = []
             current.append(line)
@@ -417,7 +439,8 @@ def _blocks_of_page(
 
         if _is_heading(line, left_margin, median_size):
             flush()
-            pending_title = line.text.strip()
+            # Dois títulos seguidos são hierarquia, não substituição.
+            pending_title = pending_title + (line.text.strip(),)
             continue
 
         if current:
@@ -473,14 +496,16 @@ def detect_tables(
 
     for page in sorted(lines_by_page):
         account = account_of_page.get(page)
-        for block, header, title in _blocks_of_page(lines_by_page[page], left_margin, median_size):
+        for block, header, titles in _blocks_of_page(
+            lines_by_page[page], left_margin, median_size
+        ):
             # '(CONTINUED)' é a mesma tabela a continuar noutra página.
-            title = _CONTINUED.sub("", title).strip() if title else title
-            if not title:
+            titles = tuple(_CONTINUED.sub("", t).strip() for t in titles if t.strip())
+            if not titles:
                 previous = carry.get(account)
-                title = previous[0] if previous and previous[1] >= page - 1 else None
-            resolved = title or "SEM TÍTULO"
-            carry[account] = (resolved, page)
+                titles = previous[0] if previous and previous[1] >= page - 1 else ()
+            resolved = titles[-1] if titles else "SEM TÍTULO"
+            carry[account] = (titles or (resolved,), page)
             numeric_lines = sum(1 for line in block if _is_numeric_line(line))
             bands = _numeric_bands(block, min_words=1 if numeric_lines < 2 else 2)
             if not bands:
@@ -492,6 +517,7 @@ def detect_tables(
                 continue
 
             key = (account, resolved, len(bands))
+            caminho = titles or (resolved,)
             if key not in groups and numeric_lines < 3:
                 # Registo isolado entre notas: junta-se à tabela do mesmo título
                 # em vez de virar tabela própria — ou pior, de se perder.
@@ -502,7 +528,7 @@ def detect_tables(
                 if sibling is not None:
                     key = sibling
             if key not in groups:
-                groups[key] = {"lines": [], "headers": [], "pages": []}
+                groups[key] = {"lines": [], "headers": [], "pages": [], "path": caminho}
                 order.append(key)
             groups[key]["lines"].extend(block)
             groups[key]["headers"].extend(header)
@@ -549,6 +575,7 @@ def detect_tables(
             TableSpec(
                 id=table_id,
                 title=title,
+                section_path=bundle.get("path") or (title,),
                 account=account,
                 pages=sorted(set(bundle["pages"])),
                 columns=columns,
@@ -561,6 +588,10 @@ def detect_tables(
 
 
 # ------------------------------------------------------------------- extração
+
+
+def _label_matches_any(label: str, titles: Sequence[str]) -> bool:
+    return any(_label_matches_title(label, title) for title in titles if title)
 
 
 def _label_matches_title(label: str, title: str) -> bool:
@@ -654,11 +685,28 @@ def _promote_category_totals(result: TableResult) -> None:
     if not column:
         return
 
+    # 'CORPORATE FIXED INCOME' seguido de 'TOTAL CORPORATE FIXED INCOME': o
+    # documento imprime a linha da categoria e, por baixo, o seu total. A
+    # primeira é tão total como a segunda — contá-la como posição punha o
+    # fecho de uma secção dentro de outra.
+    def _palavras(label: str) -> tuple[str, ...]:
+        return tuple(w.upper() for w in _SO_PALAVRAS.findall(label))
+
+    rotulos_de_total = {
+        _palavras(row["label"])[1:]
+        for row in result.rows
+        if row["row_type"] == "total" and _palavras(row["label"])[:1] == ("TOTAL",)
+    }
+    for row in result.rows:
+        palavras = _palavras(row["label"])
+        if row["row_type"] == "data" and palavras and palavras in rotulos_de_total:
+            row["row_type"] = "total"
+
     candidates = [
         row
         for row in result.rows
         if row["row_type"] == "data"
-        and _label_matches_title(row["label"], result.spec.title)
+        and _label_matches_any(row["label"], result.spec.section_path)
         and isinstance(row.get(column), Decimal)
     ]
     if not candidates:
@@ -739,6 +787,47 @@ def _cell_value(
             # Texto sem dígitos: não se perdeu dinheiro, perdeu-se o alinhamento.
             result.stray_text.append(f"{onde} com texto: {raw!r}")
     return raw
+
+
+def refine_amount_column(result: TableResult) -> str | None:
+    """Deixa o documento escolher a coluna de valor.
+
+    O nome da coluna vem do cabeçalho, e há cabeçalhos ilegíveis — rótulos
+    sobrepostos, abreviaturas, duas linhas coladas. Quando isso acontece, a
+    heurística pelo nome cai na última coluna, que num quadro de posições é o
+    *yield*: a tabela passa a somar percentagens.
+
+    Aqui procura-se a coluna em que a soma das linhas de dados bate com um total
+    que o próprio documento imprime. Se existir, é essa — provada, não adivinhada.
+    """
+    totais = [row for row in result.rows if row["row_type"] == "total"]
+    if not totais or not result.spec.amount_column:
+        return None
+
+    folga = _rounding_slack(len(result.data_rows))
+
+    def concilia(coluna: str) -> bool:
+        soma = result.sum_of(coluna)
+        return any(
+            isinstance(row.get(coluna), Decimal) and abs(soma - row[coluna]) <= folga
+            for row in totais
+        )
+
+    if concilia(result.spec.amount_column):
+        return None
+
+    for column in result.spec.columns:
+        nome = column["name"]
+        if nome in ("description", result.spec.amount_column):
+            continue
+        if concilia(nome):
+            anterior = result.spec.amount_column
+            result.spec.amount_column = nome
+            return (
+                f"{result.spec.title!r}: coluna de valor mudada de {anterior!r} para "
+                f"{nome!r} — é a que bate com o total impresso"
+            )
+    return None
 
 
 # -------------------------------------------------------------- reconciliação
@@ -887,8 +976,10 @@ def _table_total_checks(result: TableResult, column: str) -> list[Check]:
         return any(word in lowered for word in title_words)
 
     # Havendo um total que se identifica com a tabela, é esse que vale; somar
-    # também os outros contaria o mesmo dinheiro duas vezes.
-    grand = [row for row in totals if names_the_table(row["label"])]
+    # também os outros contaria o mesmo dinheiro duas vezes. A identificação é
+    # estrita — 'CORPORATE FIXED INCOME' partilha a palavra 'fixed' com
+    # 'FIXED-RATE CAPITAL SECURITIES' e não é o total dela.
+    grand = [row for row in totals if _label_matches_any(row["label"], spec.section_path)]
     reference = grand or totals
 
     printed = sum((row[column] for row in reference), Decimal("0"))

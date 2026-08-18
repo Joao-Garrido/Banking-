@@ -527,6 +527,10 @@ def _collapse_lots(result) -> list[dict]:
 def _build_positions(result, labels, dataset: Dataset, collapse_lots: bool = True) -> None:
     columns = [c["name"] for c in result.spec.columns]
     mapping = _mapping(POSITION_FIELDS, columns)
+    # Cabeçalho ilegível dá colunas 'col_3' e nenhum nome casa. A coluna de
+    # valor da tabela foi escolhida por conciliar com o total impresso — é uma
+    # fonte melhor do que ficar sem valor nenhum.
+    mapping.setdefault("valor_mercado", result.spec.amount_column)
     linhas = _collapse_lots(result) if collapse_lots else result.rows
 
     for row in linhas:
@@ -550,6 +554,7 @@ def _build_positions(result, labels, dataset: Dataset, collapse_lots: bool = Tru
 def _build_transactions(result, labels, dataset: Dataset) -> None:
     columns = [c["name"] for c in result.spec.columns]
     mapping = _mapping(TRANSACTION_FIELDS, columns)
+    mapping.setdefault("valor", result.spec.amount_column)
 
     for row in result.rows:
         if row["row_type"] != "data":

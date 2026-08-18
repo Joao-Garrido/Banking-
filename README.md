@@ -27,7 +27,7 @@ cd Banking-
 python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-pytest                                  # 178 testes; 1 salta (precisa de um statement real)
+pytest                                  # 187 testes; 1 salta (precisa de um statement real)
 python parse.py tests/fixtures/synthetic_statement.pdf   # experimenta no exemplo incluído
 ```
 
@@ -132,7 +132,8 @@ exemplos/
   fundos-exclusivos.json carteira dos fundos exclusivos (modelo)
 tests/
   expected.json          totais digitados à mão (modo curado)
-  fixtures/              statement sintético + layout revisto
+  make_ms2026_fixture.py statement sintético no desenho de 2026, a partir do guia
+  fixtures/              statements sintéticos + layout revisto
 ```
 
 ---
@@ -164,6 +165,34 @@ tests/
 8. **Arredondamento** — a folga é de um cêntimo por valor impresso que entra na
    soma. Acima disso é erro. A diferença aparece sempre na folha
    `Reconciliação`, seja qual for a classificação.
+
+---
+
+## O desenho de 2026, reconstruído a partir do guia
+
+Quando o documento não pode sair de onde está, `tests/make_ms2026_fixture.py`
+gera um statement sintético com a **estrutura** descrita no guia do desenho de
+2026 — `EXCHANGE-TRADED & CLOSED-END FUNDS`, `CORPORATE BONDS`,
+`FIXED-RATE CAPITAL SECURITIES`, `GOVERNMENT SECURITIES` com `TREASURY
+SECURITIES` por baixo, lotes fechados por `Total`, `()` para negativo e `—`/`N/A`
+para ausente. Correr o parser contra ele apanhou cinco erros que o statement de
+2016 nunca teria mostrado:
+
+1. **`—` e `N/A` não formavam coluna.** A tabela de caixa desaparecia inteira e o
+   travessão colava-se ao valor do lado. É a causa mais provável de "faltam
+   posições".
+2. **A coluna de valor era escolhida pelo nome.** Com um cabeçalho ilegível caía
+   na última coluna — que num quadro de posições é o *yield*: a tabela somava
+   percentagens. Agora, se o nome não decidir, escolhe-se a coluna que **bate com
+   o total impresso** — provada, não adivinhada.
+3. **Secção e sub-secção.** `GOVERNMENT SECURITIES` / `TREASURY SECURITIES`: a
+   linha que fecha a secção traz o nome da secção, não o da sub-secção. Guarda-se
+   a cadeia dos dois.
+4. **`CORPORATE FIXED INCOME` impresso por cima de `TOTAL CORPORATE FIXED
+   INCOME`**: a primeira linha é tão total como a segunda, e estava a ser contada
+   como posição.
+5. **`Total 21,477.613`**: a quantidade cola-se ao rótulo quando não forma coluna,
+   e o total do título deixava de ser reconhecido como tal.
 
 ---
 

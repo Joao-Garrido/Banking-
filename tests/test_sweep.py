@@ -243,7 +243,7 @@ class TestRegrasDeClassificacao:
             id="t", title="CHANGE IN VALUE", account=None, pages=[1],
             columns=[{"name": "description", "x0": 0, "x1": 10},
                      {"name": "amount", "x0": 10, "x1": 20}],
-            header="", amount_column="amount",
+            header="", amount_column="amount", section_path=("CHANGE IN VALUE",),
         )
         result = TableResult(spec=spec)
         result.rows = [
