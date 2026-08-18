@@ -25,6 +25,7 @@ import json
 import sys
 from pathlib import Path
 
+from src.diagnostico import build_report
 from src.excel import table_state, write_workbook
 from src.export import Explosion, build_export, explosion_checks
 from src.model import build_datasets, dataset_checks, portfolio_checks
@@ -121,6 +122,17 @@ def run_sweep(pdf: Path, args) -> int:
         include_raw=not args.no_raw,
     )
     print(f"\nescrito: {destination}")
+
+    if args.diagnostico:
+        relatorio = build_report(
+            pdf, layout, sweep.tables, sweep.checks, anonimo=not args.com_valores
+        )
+        destino_relatorio = Path(args.out) / f"{pdf.stem}-diagnostico.txt"
+        destino_relatorio.parent.mkdir(parents=True, exist_ok=True)
+        destino_relatorio.write_text(relatorio, encoding="utf-8")
+        print(f"escrito: {destino_relatorio}")
+        print()
+        print(relatorio)
 
     if args.csv:
         for result in sweep.tables:
@@ -327,6 +339,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="não escreve nada se alguma reconciliação falhar")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="omite a coluna com o texto original de cada linha")
+    parser.add_argument("--diagnostico", action="store_true",
+                        help="escreve um relatório de estrutura (sem valores nem nomes) a "
+                             "dizer que tabelas foram encontradas e o que falhou")
+    parser.add_argument("--com-valores", dest="com_valores", action="store_true",
+                        help="no diagnóstico, não mascara os dígitos (só para uso interno)")
     parser.add_argument("--lotes", action="store_true",
                         help="uma linha por lote em vez de uma por título (mantém a data de "
                              "compra e o custo de cada lote)")

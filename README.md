@@ -27,7 +27,7 @@ cd Banking-
 python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-pytest                                  # 166 testes; 1 salta (precisa de um statement real)
+pytest                                  # 178 testes; 1 salta (precisa de um statement real)
 python parse.py tests/fixtures/synthetic_statement.pdf   # experimenta no exemplo incluído
 ```
 
@@ -121,6 +121,7 @@ src/
   tables.py              varredura: encontra e extrai todas as tabelas
   model.py               camada canónica: tabelas -> posições/movimentos/…
   export.py              layout do consolidador + fundo exclusivo
+  diagnostico.py         relatório de estrutura, sem valores nem nomes
   router.py              página -> secção, página -> conta
   reconcile.py           vocabulário das conferências (erro vs aviso)
   excel.py               escrita do livro
@@ -286,6 +287,27 @@ python parse.py statement.pdf --sections
 
 `tests/expected.json` é preenchido **à mão**, lendo o PDF. Não pode ser gerado a
 partir do parser: se o gabarito vier do parser, o parser passa sempre.
+
+---
+
+## Quando alguma coisa falha (e não podes partilhar o documento)
+
+```bash
+python parse.py statement.pdf --diagnostico
+```
+
+Escreve `out/statement-diagnostico.txt` e mostra-o no ecrã. É um relatório de
+**estrutura**: que tabelas foram encontradas, em que páginas, com quantas
+colunas e linhas, o que conciliou, o que falhou — e **que páginas não deram
+tabela nenhuma**, que é onde quase sempre está a secção em falta.
+
+Os dígitos são mascarados com `#` e não há valores, nomes de titulares nem
+nomes de títulos: o ficheiro pode ser partilhado com quem te ajuda a resolver
+sem sair nada do cliente. (`--com-valores` desliga a máscara, para uso interno.)
+
+A última secção do relatório — **O QUE MEXER** — liga cada sintoma ao sítio
+exato: título não reconhecido → `_HEADING` em `src/tables.py`; total não
+reconhecido → `TOTAL_PATTERNS`; e por aí.
 
 ---
 

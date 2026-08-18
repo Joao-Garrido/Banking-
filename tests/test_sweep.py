@@ -271,3 +271,40 @@ class TestLeituraUnica:
         assert [t.spec.title for t in shared.tables] == [t.spec.title for t in reread.tables]
         assert [len(t.rows) for t in shared.tables] == [len(t.rows) for t in reread.tables]
         assert len(shared.checks) == len(reread.checks)
+
+
+class TestDiagnostico:
+    """O relatório para quem não pode partilhar o documento."""
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def relatorio(sweep):
+        from src.diagnostico import build_report
+
+        return build_report(FIXTURE, load_layout(LAYOUT), sweep.tables, sweep.checks)
+
+    def test_diz_o_que_encontrou(self, relatorio):
+        assert "TABELAS ENCONTRADAS (5)" in relatorio
+        assert "PÁGINAS SEM TABELA NENHUMA" in relatorio
+        assert "O QUE MEXER" in relatorio
+
+    def test_nao_leva_valores_nem_digitos(self, relatorio):
+        """É esta propriedade que o torna partilhável."""
+        corpo = "\n".join(
+            linha for linha in relatorio.splitlines()
+            if not linha.startswith(("páginas", "contas", "período", "CONFERÊNCIAS"))
+            and "TABELAS ENCONTRADAS" not in linha
+            and "PÁGINAS SEM TABELA" not in linha
+            and not linha.strip().startswith("·")
+            and not linha[:9].strip().rstrip("-").isdigit()
+        )
+        assert "1195590" not in corpo
+        assert "225,000.00" not in corpo
+
+    def test_receita_de_titulo_aponta_o_ficheiro_a_mexer(self):
+        from src.diagnostico import RECEITAS
+
+        assert "src/tables.py" in RECEITAS["sem_titulo"] + RECEITAS["pagina_sem_tabela"]
+
+    def test_documento_limpo_nao_inventa_sintomas(self, relatorio):
+        assert "nada a assinalar" in relatorio
