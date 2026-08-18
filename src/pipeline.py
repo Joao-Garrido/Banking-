@@ -129,7 +129,13 @@ def sweep_statement(
 
     `pages` são as linhas já lidas (sem corte de banda), para não reler o PDF.
     """
-    from .tables import cross_checks, detect_tables, extract_table, table_checks
+    from .tables import (
+        cross_checks,
+        detect_tables,
+        extract_table,
+        period_hint,
+        table_checks,
+    )
 
     path = Path(pdf_path)
     report = None if skip_precheck else assert_text_layer(path)
@@ -148,7 +154,12 @@ def sweep_statement(
 
     account_of_page = {page: account_for_page(layout, page) for page in by_page}
     notes: list[str] = []
-    specs = detect_tables(by_page, account_of_page=account_of_page, notes=notes)
+    specs = detect_tables(
+        by_page,
+        account_of_page=account_of_page,
+        notes=notes,
+        period=period_hint(layout),
+    )
 
     year = layout.get("statement_year")
     results = [extract_table(spec, statement_year=year) for spec in specs]

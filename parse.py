@@ -77,7 +77,7 @@ def run_sweep(pdf: Path, args) -> int:
     sweep = sweep_statement(pdf, layout, pages=pages)
 
     accounts = layout.get("accounts", [])
-    datasets = build_datasets(sweep.tables, accounts)
+    datasets = build_datasets(sweep.tables, accounts, collapse_lots=not args.lotes)
     # As vistas consolidadas também são conferidas: não podem perder nem
     # duplicar dinheiro em relação às tabelas de onde vieram.
     sweep.checks.extend(dataset_checks(datasets, sweep.tables))
@@ -327,6 +327,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="não escreve nada se alguma reconciliação falhar")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="omite a coluna com o texto original de cada linha")
+    parser.add_argument("--lotes", action="store_true",
+                        help="uma linha por lote em vez de uma por título (mantém a data de "
+                             "compra e o custo de cada lote)")
     parser.add_argument("--clientes", help="JSON conta -> {idcliente, nome} para o IDCLIENTE")
     parser.add_argument("--fundos-exclusivos", dest="fundos_exclusivos",
                         help="JSON IDATIVO -> {nome, carteira[]} dos fundos exclusivos")

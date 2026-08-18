@@ -148,6 +148,9 @@ class TableResult:
     spec: TableSpec
     rows: list[dict[str, Any]] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    # Texto puro numa coluna de valores: não há número perdido, há uma coluna
+    # que não é o que dizia ser.
+    stray_text: list[str] = field(default_factory=list)
     # Total impresso efetivamente usado na conferência (None se não houve).
     reference_total: Decimal | None = None
 
@@ -342,12 +345,45 @@ AMOUNT_PREFERENCE = (
 )
 
 
-def _pick_amount_column(names: Sequence[str]) -> str | None:
+def _pick_amount_column(
+    names: Sequence[str],
+    period_hint: str | None = None,
+    numeric_counts: Sequence[int] | None = None,
+) -> str | None:
+    """Escolhe a coluna que representa o valor da tabela.
+
+    Os quadros de sumário trazem duas colunas — 'This Period' e 'This Year' — e
+    os seus nomes acabam a ser as próprias datas. Sem preferir a do período, o
+    resumo do mês sairia com o acumulado do ano, que é outro número.
+
+    A preferência só vale para uma coluna que de facto tenha valores: numa
+    página com dois quadros lado a lado, o nome do período pode calhar a uma
+    banda de texto, e aí a heurística normal é mais fiável.
+    """
+    if period_hint:
+        melhor = max(numeric_counts) if numeric_counts else 0
+        do_periodo = [
+            name
+            for index, name in enumerate(names)
+            if period_hint in name
+            and (not numeric_counts or numeric_counts[index] >= melhor / 2)
+        ]
+        if do_periodo:
+            return do_periodo[-1]
     for preferred in AMOUNT_PREFERENCE:
         for name in names:
             if preferred in name:
                 return name
     return names[-1] if names else None
+
+
+def period_hint(layout: dict) -> str | None:
+    """Fragmento com que o statement escreve o início do período ('6_1_26')."""
+    start = layout.get("period_start")
+    if not start:
+        return None
+    year, month, day = start.split("-")
+    return f"{int(month)}_{int(day)}_{year[2:]}"
 
 
 def _blocks_of_page(
@@ -414,6 +450,7 @@ def detect_tables(
     *,
     account_of_page: dict[int, str | None] | None = None,
     notes: list[str] | None = None,
+    period: str | None = None,
 ) -> list[TableSpec]:
     """Encontra as tabelas do documento e as suas colunas.
 
@@ -487,6 +524,10 @@ def detect_tables(
             continue
 
         names = _column_names(bundle["headers"], bands)
+        numeric_counts = [
+            sum(1 for line in bundle["lines"] if _is_tabular_number(line.cell(x0, x1)))
+            for x0, x1 in bands
+        ]
         body_left = min(line.x0 for line in bundle["lines"])
         columns = [
             {"name": "description", "x0": round(body_left - COLUMN_PAD, 2), "x1": bands[0][0],
@@ -512,7 +553,7 @@ def detect_tables(
                 pages=sorted(set(bundle["pages"])),
                 columns=columns,
                 header=" | ".join(dict.fromkeys(line.text for line in bundle["headers"])),
-                amount_column=_pick_amount_column(names),
+                amount_column=_pick_amount_column(names, period, numeric_counts),
                 lines=sorted(bundle["lines"], key=lambda line: (line.page, line.top)),
             )
         )
@@ -672,10 +713,31 @@ def _cell_value(
         # Percentagem numa coluna de valores: não é dinheiro, fica como texto
         # para não entrar em soma nenhuma — e não é um problema de leitura.
         return raw.strip()
+    # 'Activity $933,772.30': o rótulo de um quadro colado ao valor do quadro
+    # ao lado. O valor é o último token e é legível — usá-lo é melhor do que
+    # perdê-lo, mas o desalinhamento fica registado.
+    partes = raw.split()
+    if len(partes) > 1 and _is_tabular_number(partes[-1]):
+        if not any(char.isdigit() for char in " ".join(partes[:-1])):
+            try:
+                valor, _marker = parse_amount_loose(partes[-1])
+            except NormalizeError:
+                valor = None
+            if valor is not None:
+                if column == spec.amount_column:
+                    result.stray_text.append(
+                        f"p.{page}: coluna de valor {column!r} com rótulo colado ao valor: {raw!r}"
+                    )
+                return valor
+
     if column == spec.amount_column:
-        result.problems.append(
-            f"p.{page}: coluna de valor {column!r} com célula não interpretável: {raw!r}"
-        )
+        onde = f"p.{page}: coluna de valor {column!r}"
+        if any(char.isdigit() for char in raw):
+            # Há ali um número que não conseguimos ler — isso é um valor perdido.
+            result.problems.append(f"{onde} com célula não interpretável: {raw!r}")
+        else:
+            # Texto sem dígitos: não se perdeu dinheiro, perdeu-se o alinhamento.
+            result.stray_text.append(f"{onde} com texto: {raw!r}")
     return raw
 
 
@@ -698,8 +760,52 @@ def _rounding_slack(count: int) -> Decimal:
     return Decimal("0.01") * max(count, 1)
 
 
+# Acima disto, o problema deixa de ser uma célula e passa a ser a tabela: nas
+# páginas de sumário o statement imprime dois quadros lado a lado, e as colunas
+# de um invadem o outro. Dizê-lo uma vez é mais útil do que repetir o mesmo
+# erro por cada célula.
+PROBLEMAS_QUE_SAO_DA_TABELA = 3
+
+
 def _cell_problem_checks(result: TableResult) -> list[Check]:
-    return [
+    checks: list[Check] = []
+    if result.stray_text:
+        checks.append(
+            Check(
+                section=result.spec.title,
+                name="texto na coluna de valores",
+                passed=False,
+                extracted=f"{len(result.stray_text)} célula(s)",
+                expected="valores",
+                page=result.spec.pages[0],
+                detail=(
+                    f"a coluna {result.spec.amount_column!r} apanha texto em algumas linhas "
+                    "— não há valor perdido, mas as colunas desta tabela não estão bem "
+                    f"alinhadas: {result.stray_text[0].split(': ', 1)[-1]}"
+                ),
+                severity="aviso",
+            )
+        )
+
+    if len(result.problems) >= PROBLEMAS_QUE_SAO_DA_TABELA:
+        return checks + [
+            Check(
+                section=result.spec.title,
+                name="colunas desalinhadas",
+                passed=False,
+                extracted=f"{len(result.problems)} células ilegíveis",
+                expected="colunas alinhadas",
+                page=result.spec.pages[0],
+                detail=(
+                    f"a coluna {result.spec.amount_column!r} mistura texto e valores — "
+                    "sinal de dois quadros impressos lado a lado nesta página. Os números "
+                    "estão no livro, mas as colunas desta tabela não são de confiança: "
+                    f"exemplos: {'; '.join(p.split(': ', 1)[-1] for p in result.problems[:2])}"
+                ),
+                severity="aviso",
+            )
+        ]
+    return checks + [
         Check(
             section=result.spec.title,
             name="célula não interpretada",

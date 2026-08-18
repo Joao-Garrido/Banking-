@@ -28,7 +28,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
-from .reconcile import Check, compare
+import re as _re
+
+from .reconcile import TOLERANCE, Check, compare
+
+# 'Total' isolado fecha um título; 'TOTAL MUTUAL FUNDS' fecha a tabela.
+_PLAIN_TOTAL = _re.compile(r"^totals?$", _re.IGNORECASE)
 
 __all__ = [
     "Domain",
@@ -99,7 +104,7 @@ DOMAIN_PATTERNS: list[tuple[str, str]] = [
     (r"overview|change\s+in\s+value|balance\s+sheet|summary", Domain.OVERVIEW),
     (
         r"stocks|funds|holdings|bonds|securities|cash,|bank\s+deposit|money\s+market"
-        r"|options|annuities|preferred|structured",
+        r"|options|annuities|preferred|structured|fixed\s+income|treasury",
         Domain.POSITIONS,
     ),
 ]
@@ -337,6 +342,9 @@ class Dataset:
     domain: str
     rows: list[dict[str, Any]] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
+    # True quando as posições foram reduzidas a uma linha por título, usando o
+    # 'Total' impresso pelo banco em vez da soma dos lotes.
+    collapsed: bool = False
 
     @property
     def title(self) -> str:
@@ -426,8 +434,14 @@ def _strip_symbol(text: str) -> str:
 
 # ----------------------------------------------------------------- construção
 
-def build_datasets(tables: Sequence, accounts: Sequence[dict]) -> dict[str, Dataset]:
-    """Constrói as vistas canónicas a partir das tabelas extraídas."""
+def build_datasets(
+    tables: Sequence, accounts: Sequence[dict], *, collapse_lots: bool = True
+) -> dict[str, Dataset]:
+    """Constrói as vistas canónicas a partir das tabelas extraídas.
+
+    collapse_lots=True (o normal) dá uma linha por título; False mantém o
+    detalhe lote a lote, para quem precisa de base de custo por lote.
+    """
     labels = {a["id"]: (a.get("label") or "") for a in accounts}
     datasets = {domain: Dataset(domain=domain) for domain in DOMAIN_ORDER}
 
@@ -439,8 +453,12 @@ def build_datasets(tables: Sequence, accounts: Sequence[dict]) -> dict[str, Data
         builder = _BUILDERS.get(domain)
         if builder is None:
             continue
-        builder(result, labels, dataset)
+        if domain == Domain.POSITIONS:
+            builder(result, labels, dataset, collapse_lots)
+        else:
+            builder(result, labels, dataset)
 
+    datasets[Domain.POSITIONS].collapsed = collapse_lots
     _add_weights(datasets[Domain.POSITIONS])
     datasets[Domain.INCOME] = _income_from(datasets[Domain.TRANSACTIONS])
     return datasets
@@ -460,11 +478,58 @@ def _numbers(row: dict, mapping: dict[str, str], fields: Iterable[str]) -> dict[
     return {name: row.get(mapping[name]) for name in fields if name in mapping}
 
 
-def _build_positions(result, labels, dataset: Dataset) -> None:
+def _collapse_lots(result) -> list[dict]:
+    """Uma linha por título, não por lote.
+
+    O statement imprime cada posição lote a lote e fecha o título com uma linha
+    'Total'. Para uma carteira, o que interessa é o título — e o 'Total' que o
+    banco imprime é melhor do que a soma que nós faríamos, porque é o número
+    contra o qual o cliente vai conferir. Onde não há 'Total' (títulos de lote
+    único), a própria linha do título é a posição.
+
+    A soma dos lotes contra esse 'Total' continua a ser conferida em
+    `tables.table_checks`: colapsar aqui não faz perder a prova.
+    """
+    por_grupo: dict[str, list[dict]] = {}
+    ordem: list[str] = []
+    for row in result.rows:
+        if row["row_type"] not in ("data", "total"):
+            continue
+        grupo = row.get("group") or row.get("label") or ""
+        if grupo not in por_grupo:
+            por_grupo[grupo] = []
+            ordem.append(grupo)
+        por_grupo[grupo].append(row)
+
+    colapsadas: list[dict] = []
+    for grupo in ordem:
+        linhas = por_grupo[grupo]
+        total = next(
+            (r for r in linhas if r["row_type"] == "total" and _PLAIN_TOTAL.match(r["label"].strip())),
+            None,
+        )
+        if total is not None:
+            # A linha 'Total' não traz a descrição do título: vem do grupo.
+            colapsada = dict(total)
+            colapsada["row_type"] = "data"
+            colapsada["label"] = grupo
+            colapsada["description"] = grupo
+            # Data de compra deixa de fazer sentido: são vários lotes.
+            colapsada["date"] = None
+            colapsada["dates"] = []
+            colapsadas.append(colapsada)
+            continue
+        colapsadas.extend(r for r in linhas if r["row_type"] == "data")
+
+    return colapsadas
+
+
+def _build_positions(result, labels, dataset: Dataset, collapse_lots: bool = True) -> None:
     columns = [c["name"] for c in result.spec.columns]
     mapping = _mapping(POSITION_FIELDS, columns)
+    linhas = _collapse_lots(result) if collapse_lots else result.rows
 
-    for row in result.rows:
+    for row in linhas:
         if row["row_type"] != "data":
             continue
         title = row.get("group") or row.get("description") or ""
@@ -679,16 +744,34 @@ def dataset_checks(datasets: dict[str, Dataset], tables: Sequence) -> list[Check
             Decimal("0"),
         )
 
+        detail = (
+            f"{len(data_rows)} linhas de {len(by_domain.get(domain, []))} tabela(s) "
+            f"na coluna {field_name!r}"
+        )
+        # Com as posições reduzidas a uma linha por título, a vista soma os
+        # 'Total' impressos e a origem soma os lotes. O statement arredonda cada
+        # um ao cêntimo, por isso a folga é de um cêntimo por linha de origem —
+        # a mesma regra usada em todas as outras conferências.
+        tolerancia = TOLERANCE
+        if domain == Domain.POSITIONS and dataset.collapsed:
+            origem_linhas = sum(
+                len([r for r in result.rows if r["row_type"] == "data"])
+                for result in by_domain.get(domain, [])
+            )
+            tolerancia = Decimal("0.01") * max(origem_linhas, 1)
+            detail += (
+                " — a vista usa o 'Total' que o banco imprime para cada título, "
+                "a origem soma os lotes"
+            )
+
         checks.append(
             compare(
                 dataset.title,
                 "vista canónica vs tabelas de origem",
                 canonical,
                 origin,
-                detail=(
-                    f"{len(data_rows)} linhas de {len(by_domain.get(domain, []))} tabela(s) "
-                    f"na coluna {field_name!r}"
-                ),
+                detail=detail,
+                tolerance=tolerancia,
             )
         )
 
