@@ -1,560 +1,767 @@
-"""Camada visual do relatório de consolidação — tokens, estilos Excel e gráficos.
+"""Camada visual do Relatório BFO — tokens, chassis de página, tabelas e gráficos.
 
-Este módulo é a parte "difícil de acertar a olho": paleta, tipografia, formatos
-numéricos, espaçamento e as regras de desenho dos gráficos. **Está completo.**
-Quem estender o relatório não deve inventar cores nem formatos aqui — deve
-consumir os tokens abaixo, para que todas as folhas e todos os gráficos leiam
-como um só sistema.
+Implementa o **Guia visual e de estilo do Relatório BFO**. Cada bloco aponta a
+secção do guia que o manda fazer assim; as secções citadas são as do guia:
 
-Regras que este módulo não quebra (e que quem mexer aqui não deve quebrar):
+    §3  paleta          §4  tipografia      §5  cabeçalho, rodapé e margens
+    §6  paginação       §7  evolução        §8  rentabilidade
+    §9  roscas          §10 performance     §11 tabelas
 
-* cor categórica é atribuída por **entidade**, em ordem fixa (`SLOT_CLASSE`),
-  nunca ciclada e nunca por ranking — filtrar séries não repinta as que ficam;
-* nunca dois eixos y no mesmo gráfico: duas medidas de escala diferente são
-  dois gráficos;
-* sequencial = um tom, claro→escuro; divergente = dois tons + cinzento neutro;
-* ≥2 séries ⇒ legenda sempre presente, e até 4 séries também rotuladas
-  diretamente — a identidade nunca depende só da cor;
-* texto veste tokens de texto (`INK`, `INK_2`, `MUTED`), nunca a cor da série;
-* cores de estado (bom/aviso/grave/crítico) são reservadas e vêm sempre com
-  ícone + palavra, nunca cor sozinha;
-* marcas finas, grelha recessiva, rótulos seletivos — nunca um número em cada
-  ponto.
+Este módulo é a parte que costuma sair mal quando se pede "um relatório
+bonito": cor, densidade, hierarquia e composição. Está completo e é o único
+sítio onde se escolhem cores, tamanhos e espaçamentos — quem montar páginas
+novas consome os tokens daqui em vez de inventar os seus.
 
-A paleta é a instância de referência validada (checagem de banda de luminosidade,
-piso de croma, separação para daltonismo e contraste). Trocar por uma paleta de
-marca implica revalidar: não basta trocar os hex.
+Duas notas de fidelidade ao guia, deliberadas e assinaladas onde acontecem:
+
+* §7 manda a evolução patrimonial ter **dois eixos y** (movimentações à
+  esquerda, património à direita). É contra a prática corrente de visualização
+  — dois eixos deixam comparar grandezas que não são comparáveis — mas é o que
+  o guia exige, e é a convenção destes relatórios. Fica implementado como
+  mandado, com o título da unidade em cada eixo, que é a mitigação possível.
+* §11 manda "negativos entre parênteses ou com sinal, mas manter um padrão
+  único". Escolhido: **dinheiro entre parênteses, percentagem com sinal**. Uma
+  coluna nunca mistura os dois. Se a casa preferir o contrário, muda-se em
+  `moeda()` e `percentual()` e nada mais.
+
+Tipos de letra: o texto usa Helvetica (§4, embutida no PDF, métrica de Arial);
+os gráficos usam a primeira de Arial/Liberation Sans/DejaVu Sans que exista na
+máquina — Liberation tem a métrica da Arial, por isso o desenho não muda.
 """
 
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import matplotlib
 
-matplotlib.use("Agg")  # sem display: renderiza para ficheiro
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from matplotlib.ticker import FuncFormatter
-from openpyxl.drawing.image import Image as XLImage
-from openpyxl.formatting.rule import DataBarRule
-from openpyxl.styles import Alignment, Border, Font, NamedStyle, PatternFill, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.properties import PageSetupProperties
-from openpyxl.worksheet.worksheet import Worksheet
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.platypus import (
+    BaseDocTemplate, CondPageBreak, Flowable, Frame, Image, LongTable,
+    PageTemplate, Paragraph, Table, TableStyle,
+)
 
 __all__ = [
-    "xl", "SERIES", "SLOT_CLASSE", "SEQ", "DIVERGENTE", "ESTADO", "SURFACE", "INK",
-    "FMT_DINHEIRO", "FMT_PERCENT", "cor_da_classe", "registar_estilos",
-    "preparar_folha", "titulo_folha", "cabecalho_tabela", "escrever_tabela",
-    "kpi_tile", "faixa_kpi", "barra_de_peso", "colar_grafico",
-    "grafico_rosca", "grafico_barras_empilhadas", "grafico_linha",
-    "grafico_ranking", "grafico_cascata",
+    "VERMELHO_LOCAL", "AZUL_INTERNACIONAL", "AZUL_TITULO", "CINZA_TEXTO",
+    "cor_de_classe", "moeda", "percentual", "abreviado", "numero", "eixo_percent",
+    "ESTILOS", "DocumentoBFO", "MarcaCambial", "titulo_pagina", "abre_secao",
+    "titulo_capa", "rotulo_capa", "subtitulo",
+    "nota", "tabela", "tabela_indicadores", "grade_de_blocos", "LARGURA_UTIL",
+    "grafico_evolucao_patrimonial", "grafico_rentabilidade_acumulada",
+    "rosca", "grafico_atribuicao", "grafico_vencimentos",
 ]
 
-# ── Paleta ────────────────────────────────────────────────────────────────────
-# Slots categóricos, ordem fixa. O 9.º elemento nunca ganha um tom novo: agrupa-se
-# em "Outros" ou parte-se o gráfico em pequenos múltiplos.
-SERIES: tuple[str, ...] = (
-    "#2a78d6",  # 1 azul
-    "#eb6834",  # 2 laranja
-    "#1baf7a",  # 3 água
-    "#eda100",  # 4 amarelo
-    "#e87ba4",  # 5 magenta
-    "#008300",  # 6 verde
-    "#4a3aa7",  # 7 violeta
-    "#e34948",  # 8 vermelho
-)
-# Formas com muitas comparações par-a-par (dispersão, bolhas, mapas) só validam
-# até três slots — acima disso, agrupar ou facetar.
-SERIES_MAX_TODOS_OS_PARES = 3
+# ── §3.1 Cores principais ─────────────────────────────────────────────────────
+VERMELHO_LOCAL = "#CC092F"        # Local, Onshore, BRL, barras principais
+AZUL_INTERNACIONAL = "#191C38"    # Internacional, Offshore, USD, linha patrimonial
+AZUL_TITULO = "#1A4056"           # títulos, subtítulos, cabeçalhos, divisórias
+CINZA_TEXTO = "#464646"           # corpo, rótulos, eixos, notas
+CINZA_MEDIO = "#B8B8B8"           # resultado não realizado, séries auxiliares
+CINZA_GRADE = "#E0E0E0"           # grade e separadores discretos
+CINZA_CABECALHO = "#F0F2F4"       # fundo dos cabeçalhos de tabela
+CINZA_ALTERNADO = "#FAFAFA"       # zebra striping
+BRANCO = "#FFFFFF"
 
-# Sequencial (magnitude contínua): um só tom, claro→escuro.
-SEQ: tuple[str, ...] = (
-    "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec",
-    "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab",
-    "#184f95", "#104281", "#0d366b",
-)
-# Divergente (polaridade): dois polos + cinzento neutro ao meio.
-DIVERGENTE = {"positivo": "#2a78d6", "neutro": "#f0efec", "negativo": "#e34948"}
+# ── §3.2 Paleta auxiliar para classes ─────────────────────────────────────────
+# Várias classes numa mesma rosca ou gráfico. A ordem é fixa: a mesma classe
+# recebe sempre o mesmo tom (§3.3 — "a mesma classe deve manter a mesma cor").
+CLASSES_LOCAL = ("#CC092F", "#A93D4B", "#8F6A6B", "#6A393A", "#757788", "#CFC9C1")
+CLASSES_INTERNACIONAL = ("#191C38", "#474960", "#757788", "#9A9BA8", "#CFC9C1", "#DCDCDC")
 
-# Estado — reservado. Nunca serve de "série 4". Vai sempre com ícone + palavra.
-ESTADO = {
-    "bom": "#0ca30c",
-    "aviso": "#fab219",
-    "grave": "#ec835a",
-    "critico": "#d03b3b",
-}
-ICONE_ESTADO = {"bom": "▲", "aviso": "!", "grave": "!", "critico": "▼"}
-
-# Superfícies e tinta.
-SURFACE = "#fcfcfb"    # fundo do gráfico
-PLANE = "#f9f9f7"      # plano da página
-INK = "#0b0b0b"        # tinta primária
-INK_2 = "#52514e"      # tinta secundária
-MUTED = "#898781"      # eixos, rótulos de apoio
-GRID = "#e1e0d9"       # grelha, fio de cabelo
-BASELINE = "#c3c2b7"   # linha de base / eixo
-DELTA_BOM = "#006300"  # texto de variação positiva (não é a cor de estado)
-
-FONT = "DejaVu Sans"  # pilha sans do sistema; trocar pela da casa se houver
-
-# ── Amarração cor↔classe de ativo ─────────────────────────────────────────────
-# A cor segue a ENTIDADE, não a posição na lista. Uma classe mantém o mesmo tom
-# na capa, na folha de alocação e em qualquer gráfico futuro.
-SLOT_CLASSE: dict[str, int] = {
-    "Ações": 0,
-    "Rendimento fixo": 1,
-    "Fundos": 2,
-    "Alternativos": 3,
-    "Imobiliário": 4,
-    "Liquidez": 5,
-    "Estruturados": 6,
-    "Outros": 7,
-}
+LOCAL, INTERNACIONAL = "Local", "Internacional"
 
 
-def cor_da_classe(classe: str) -> str:
-    """Tom fixo de uma classe de ativo. Classe desconhecida cai em 'Outros'."""
-    return SERIES[SLOT_CLASSE.get(classe, SLOT_CLASSE["Outros"])]
+def cor_de_classe(segmento: str, indice: int) -> str:
+    """Tom de uma classe dentro do seu segmento (§3.2).
 
-
-# ── Formatos numéricos Excel ──────────────────────────────────────────────────
-FMT_DINHEIRO = '#,##0.00;[Red]-#,##0.00'
-FMT_DINHEIRO_CURTO = '#,##0;[Red]-#,##0'
-FMT_PERCENT = '0.0"%"'
-FMT_PERCENT_SINAL = '+0.0"%";[Red]-0.0"%";0.0"%"'
-FMT_QUANTIDADE = '#,##0.000'
-FMT_DATA = 'yyyy-mm-dd'
-
-def xl(cor: str) -> str:
-    """Hex para openpyxl: sem '#', em maiúsculas (o Excel só aceita aRGB/RGB hex)."""
-    return cor.lstrip("#").upper()
-
-
-_THIN = Side(style="thin", color=xl(GRID))
-
-
-def registar_estilos(wb) -> None:
-    """Regista os estilos nomeados uma vez por livro (idempotente)."""
-    existentes = {s.name for s in wb._named_styles}
-    defs: list[NamedStyle] = []
-
-    corpo = NamedStyle("fo_corpo")
-    corpo.font = Font(name=FONT, size=10, color=xl(INK))
-    corpo.alignment = Alignment(vertical="center")
-    corpo.border = Border(bottom=_THIN)
-    defs.append(corpo)
-
-    dinheiro = NamedStyle("fo_dinheiro")
-    dinheiro.font = Font(name=FONT, size=10, color=xl(INK))
-    dinheiro.number_format = FMT_DINHEIRO
-    dinheiro.alignment = Alignment(horizontal="right", vertical="center")
-    dinheiro.border = Border(bottom=_THIN)
-    defs.append(dinheiro)
-
-    percent = NamedStyle("fo_percent")
-    percent.font = Font(name=FONT, size=10, color=xl(INK_2))
-    percent.number_format = FMT_PERCENT
-    percent.alignment = Alignment(horizontal="right", vertical="center")
-    percent.border = Border(bottom=_THIN)
-    defs.append(percent)
-
-    total = NamedStyle("fo_total")
-    total.font = Font(name=FONT, size=10, bold=True, color=xl(INK))
-    total.number_format = FMT_DINHEIRO
-    total.alignment = Alignment(horizontal="right", vertical="center")
-    total.fill = PatternFill("solid", fgColor="EDF3FC")
-    total.border = Border(top=Side(style="thin", color=xl(BASELINE)), bottom=Side(style="double", color=xl(BASELINE)))
-    defs.append(total)
-
-    for estilo in defs:
-        if estilo.name not in existentes:
-            wb.add_named_style(estilo)
-
-
-# ── Chassis da folha ──────────────────────────────────────────────────────────
-def preparar_folha(ws: Worksheet, *, larguras: Sequence[float] = (), tab: str | None = None,
-                   paisagem: bool = True) -> None:
-    """Desliga a grelha, fixa larguras e prepara a folha para impressão/PDF.
-
-    Desligar a grelha é o que mais separa uma folha desenhada de uma folha
-    despejada: o branco passa a ser espaço, não ruído.
+    O índice é a posição **canónica** da classe na lista de classes do
+    relatório — não a posição no gráfico. É isso que garante que filtrar ou
+    reordenar não repinta nada. Passada a sexta classe, o guia não define tom:
+    agrupa-se o resto em "Outros" com o último cinza, em vez de inventar cor.
     """
-    ws.sheet_view.showGridLines = False
-    if tab:
-        ws.sheet_properties.tabColor = xl(tab)
-    for i, largura in enumerate(larguras, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = largura
-    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
-    ws.page_setup.orientation = "landscape" if paisagem else "portrait"
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.page_margins.left = ws.page_margins.right = 0.4
+    escala = CLASSES_LOCAL if segmento == LOCAL else CLASSES_INTERNACIONAL
+    return escala[min(indice, len(escala) - 1)]
 
 
-def titulo_folha(ws: Worksheet, titulo: str, subtitulo: str = "", *, linha: int = 2,
-                 coluna: int = 2) -> int:
-    """Bloco de título. Devolve a primeira linha livre abaixo."""
-    c = ws.cell(row=linha, column=coluna, value=titulo)
-    c.font = Font(name=FONT, size=18, bold=True, color=xl(INK))
-    ws.row_dimensions[linha].height = 26
-    if subtitulo:
-        s = ws.cell(row=linha + 1, column=coluna, value=subtitulo)
-        s.font = Font(name=FONT, size=10, color=xl(MUTED))
-        ws.row_dimensions[linha + 1].height = 16
-        return linha + 3
-    return linha + 2
+# ── §4 Tipografia ─────────────────────────────────────────────────────────────
+FONTE = "Helvetica"
+FONTE_BOLD = "Helvetica-Bold"
+
+# Tamanhos dentro das bandas do guia, no topo de cada banda: o guia pede
+# densidade de relatório institucional "sem prejudicar a leitura".
+PT_TITULO = 10      # §4: título da página, 8 a 10 pt
+PT_SUBTITULO = 8    # §4: subtítulo de secção, 6 a 8 pt
+PT_INDICADOR = 12   # §4: indicador principal, 9 a 12 pt
+PT_TABELA = 6       # §4: corpo e cabeçalho de tabela, 4,5 a 6 pt
+PT_NOTA = 5         # §4: notas e fontes, 4 a 5 pt
+PT_RODAPE = 5       # §4: rodapé, 4 a 5 pt
+
+_CANDIDATAS = ("Arial", "Liberation Sans", "DejaVu Sans")
+_INSTALADAS = {f.name for f in font_manager.fontManager.ttflist}
+FONTE_GRAFICO = next((f for f in _CANDIDATAS if f in _INSTALADAS), "DejaVu Sans")
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": [FONTE_GRAFICO],
+    "axes.unicode_minus": False,
+})
+
+ESTILOS = {
+    "titulo": ParagraphStyle(
+        "titulo", fontName=FONTE, fontSize=PT_TITULO, leading=PT_TITULO * 1.3,
+        textColor=colors.HexColor(AZUL_TITULO), spaceAfter=3, alignment=TA_LEFT),
+    "subtitulo": ParagraphStyle(
+        "subtitulo", fontName=FONTE_BOLD, fontSize=PT_SUBTITULO,
+        leading=PT_SUBTITULO * 1.35, textColor=colors.HexColor(AZUL_TITULO),
+        spaceBefore=6, spaceAfter=3, alignment=TA_LEFT),
+    "indicador": ParagraphStyle(
+        "indicador", fontName=FONTE_BOLD, fontSize=PT_INDICADOR,
+        leading=PT_INDICADOR * 1.15, textColor=colors.HexColor(AZUL_TITULO),
+        alignment=TA_LEFT),
+    "rotulo": ParagraphStyle(
+        "rotulo", fontName=FONTE, fontSize=PT_NOTA, leading=PT_NOTA * 1.4,
+        textColor=colors.HexColor(CINZA_TEXTO), alignment=TA_LEFT),
+    "corpo": ParagraphStyle(
+        "corpo", fontName=FONTE, fontSize=PT_TABELA, leading=PT_TABELA * 1.45,
+        textColor=colors.HexColor(CINZA_TEXTO), alignment=TA_LEFT),
+    "nota": ParagraphStyle(
+        "nota", fontName=FONTE, fontSize=PT_NOTA, leading=PT_NOTA * 1.5,
+        textColor=colors.HexColor(CINZA_TEXTO), spaceBefore=4, alignment=TA_LEFT),
+    # A capa tem estilo próprio para **não** entrar no índice: o índice lista as
+    # secções, não a si mesmo.
+    "capa": ParagraphStyle(
+        "capa", fontName=FONTE, fontSize=PT_TITULO + 3, leading=(PT_TITULO + 3) * 1.3,
+        textColor=colors.HexColor(AZUL_TITULO), spaceAfter=3, alignment=TA_LEFT),
+    "capa_sub": ParagraphStyle(
+        "capa_sub", fontName=FONTE_BOLD, fontSize=PT_SUBTITULO,
+        leading=PT_SUBTITULO * 1.35, textColor=colors.HexColor(AZUL_TITULO),
+        spaceBefore=6, spaceAfter=3, alignment=TA_LEFT),
+    "toc1": ParagraphStyle(
+        "toc1", fontName=FONTE, fontSize=PT_SUBTITULO, leading=PT_SUBTITULO * 1.8,
+        textColor=colors.HexColor(AZUL_TITULO)),
+    "toc2": ParagraphStyle(
+        "toc2", fontName=FONTE, fontSize=PT_TABELA, leading=PT_TABELA * 2,
+        leftIndent=12, textColor=colors.HexColor(CINZA_TEXTO)),
+}
+
+# ── §5 Margens e área útil ────────────────────────────────────────────────────
+PAGINA = A4
+MARGEM_LATERAL = 14 * mm
+MARGEM_SUPERIOR = 16 * mm   # deixa o cabeçalho respirar
+MARGEM_INFERIOR = 12 * mm
+LARGURA_UTIL = PAGINA[0] - 2 * MARGEM_LATERAL
+ALTURA_UTIL = PAGINA[1] - MARGEM_SUPERIOR - MARGEM_INFERIOR
+# §5 pede conteúdo em 85% a 92% da área útil. Com estas margens, a mancha ocupa
+# ~90% da largura da folha: dentro da banda, e igual em todas as páginas.
+OCUPACAO = LARGURA_UTIL / PAGINA[0]
+assert 0.85 <= OCUPACAO <= 0.92, f"mancha em {OCUPACAO:.0%} da folha, fora de §5"
 
 
-def cabecalho_tabela(ws: Worksheet, linha: int, coluna: int, nomes: Sequence[str],
-                     alinhamentos: Sequence[str] = ()) -> None:
-    """Cabeçalho de tabela: fundo tinta, texto branco, uma linha, sem bordas gordas."""
-    for i, nome in enumerate(nomes):
-        c = ws.cell(row=linha, column=coluna + i, value=nome)
-        c.font = Font(name=FONT, size=9, bold=True, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor=xl(INK))
-        horiz = alinhamentos[i] if i < len(alinhamentos) else "left"
-        c.alignment = Alignment(horizontal=horiz, vertical="center", wrap_text=True)
-    ws.row_dimensions[linha].height = 22
+# ── §11 Formatação numérica ───────────────────────────────────────────────────
+def _pt_br(valor: Decimal | float, casas: int) -> str:
+    """1234567.89 → '1.234.567,89' (§11: padrão brasileiro)."""
+    texto = f"{abs(Decimal(str(valor))):,.{casas}f}"
+    return texto.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
 
-def escrever_tabela(ws: Worksheet, linha: int, coluna: int, nomes: Sequence[str],
-                    linhas: Iterable[Sequence], *, estilos: Sequence[str] = (),
-                    alinhamentos: Sequence[str] = (), zebra: bool = True,
-                    total: Sequence | None = None, autofiltro: bool = True) -> int:
-    """Escreve uma tabela completa (cabeçalho, corpo, total) e devolve a linha seguinte.
+def moeda(valor: Decimal | float | None, unidade: str = "R$", casas: int = 2) -> str:
+    """Valor monetário. Negativo **entre parênteses** — o padrão único (§11).
 
-    `estilos` nomeia, por coluna, um dos estilos registados em `registar_estilos`
-    ('fo_corpo', 'fo_dinheiro', 'fo_percent'). O que não for nomeado usa corpo.
+    `None` devolve vazio: o guia proíbe preencher indicador indisponível com
+    valor artificial (§2.7).
     """
-    cabecalho_tabela(ws, linha, coluna, nomes, alinhamentos)
-    r = linha + 1
-    for n, valores in enumerate(linhas):
-        for i, valor in enumerate(valores):
-            c = ws.cell(row=r, column=coluna + i, value=valor)
-            c.style = estilos[i] if i < len(estilos) and estilos[i] else "fo_corpo"
-            if zebra and n % 2 == 1:
-                c.fill = PatternFill("solid", fgColor="F7F7F5")
-        ws.row_dimensions[r].height = 18
-        r += 1
+    if valor is None:
+        return ""
+    corpo = f"{unidade} {_pt_br(valor, casas)}".strip()
+    return f"({corpo})" if Decimal(str(valor)) < 0 else corpo
+
+
+def numero(valor: Decimal | float | None, casas: int = 2) -> str:
+    if valor is None:
+        return ""
+    corpo = _pt_br(valor, casas)
+    return f"({corpo})" if Decimal(str(valor)) < 0 else corpo
+
+
+def percentual(valor: Decimal | float | None, casas: int = 2) -> str:
+    """Percentagem com duas casas e **sinal explícito** (§11)."""
+    if valor is None:
+        return ""
+    return f"{'-' if Decimal(str(valor)) < 0 else '+'}{_pt_br(valor, casas)}%"
+
+
+def eixo_percent(valor: float, casas: int = 1) -> str:
+    """Marca de eixo em percentagem, com o sinal à frente.
+
+    `_pt_br` formata o módulo — num eixo que atravessa o zero, esquecer o sinal
+    transforma −1,0% em 1,0% e inverte a leitura do gráfico.
+    """
+    return f"{'-' if valor < 0 else ''}{_pt_br(valor, casas)}%"
+
+
+def abreviado(valor: Decimal | float, unidade: str = "R$") -> str:
+    """Rótulo curto de gráfico: 'R$ 146,6 mi', 'USD 18,8 mi' (§7).
+
+    O sinal vai à frente, não entre parênteses: num eixo que atravessa o zero,
+    parênteses leem-se mal e o eixo já mostra a linha de zero. Os parênteses de
+    §11 são para as tabelas, onde não há eixo a dar o contexto.
+    """
+    v = float(valor)
+    sinal = "-" if v < 0 else ""
+    for corte, sufixo in ((1e9, " bi"), (1e6, " mi"), (1e3, " mil")):
+        if abs(v) >= corte:
+            return f"{sinal}{unidade} {_pt_br(v / corte, 1)}{sufixo}".strip()
+    return f"{sinal}{unidade} {_pt_br(v, 0)}".strip()
+
+
+# ── §5 Cabeçalho, rodapé e paginação ──────────────────────────────────────────
+class _CanvasNumerado(rl_canvas.Canvas):
+    """Desenha cabeçalho e rodapé sabendo o total de páginas.
+
+    O guia manda `Página X de Y` com o total "calculado somente após a
+    paginação final" (§5): as páginas ficam guardadas e só se desenham no fim,
+    quando `Y` já é conhecido.
+    """
+
+    def __init__(self, *args, contexto=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._paginas: list[dict] = []
+        self._contexto = contexto or {}
+
+    def showPage(self):
+        self._paginas.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._paginas)
+        for estado in self._paginas:
+            self.__dict__.update(estado)
+            self._cabecalho()
+            self._rodape(total)
+            super().showPage()
+        super().save()
+
+    def _cabecalho(self) -> None:
+        """Título à esquerda, marca à direita, fio fino por baixo, fundo branco."""
+        ctx = self._contexto
+        y = PAGINA[1] - MARGEM_SUPERIOR + 6 * mm
+        self.setFont(FONTE, PT_TITULO)
+        self.setFillColor(colors.HexColor(AZUL_TITULO))
+        self.drawString(MARGEM_LATERAL, y, ctx.get("titulo", ""))
+        self.setFont(FONTE_BOLD, PT_TITULO)
+        self.drawRightString(PAGINA[0] - MARGEM_LATERAL, y, ctx.get("marca", "BFO"))
+        self.setStrokeColor(colors.HexColor(CINZA_GRADE))
+        self.setLineWidth(0.4)
+        self.line(MARGEM_LATERAL, y - 2.5 * mm, PAGINA[0] - MARGEM_LATERAL, y - 2.5 * mm)
+
+    def _rodape(self, total: int) -> None:
+        """Competência à esquerda, `Página X de Y` à direita, nota cambial (§5)."""
+        ctx = self._contexto
+        y = MARGEM_INFERIOR - 5 * mm
+        self.setFont(FONTE, PT_RODAPE)
+        self.setFillColor(colors.HexColor(CINZA_TEXTO))
+        if ctx.get("competencia"):
+            self.drawString(MARGEM_LATERAL, y, ctx["competencia"])
+        if self._pageNumber in ctx.get("cambiais", set()) and ctx.get("nota_cambial"):
+            self.drawCentredString(PAGINA[0] / 2, y, ctx["nota_cambial"])
+        self.drawRightString(PAGINA[0] - MARGEM_LATERAL, y,
+                             f"Página {self._pageNumber} de {total}")
+
+
+class MarcaCambial(Flowable):
+    """Liga e desliga a nota cambial do rodapé (§5).
+
+    Não desenha nada: comuta um interruptor. Enquanto estiver ligado, cada
+    página por onde o conteúdo passar fica marcada como consolidando BRL e USD
+    — é assim que uma secção que atravessa cinco páginas leva a nota nas cinco,
+    e não só na primeira.
+
+        historia += [MarcaCambial(ctx, True), *conteudo_consolidado,
+                     MarcaCambial(ctx, False)]
+    """
+
+    width = height = 0
+
+    def __init__(self, contexto: dict, ligar: bool = True):
+        super().__init__()
+        self._contexto = contexto
+        self._ligar = ligar
+
+    def draw(self) -> None:
+        self._contexto["cambial_ativo"] = self._ligar
+        if self._ligar:
+            self._contexto.setdefault("cambiais", set()).add(self.canv.getPageNumber())
+
+
+class DocumentoBFO(BaseDocTemplate):
+    """Documento com o chassis do guia: margens, cabeçalho, rodapé e índice.
+
+    O índice é construído em duas passagens (`multiBuild`), como §6 pede —
+    "gerar depois que todas as páginas estiverem prontas".
+    """
+
+    def __init__(self, destino: Path, titulo: str, competencia: str = "",
+                 nota_cambial: str = "", marca: str = "BFO"):
+        super().__init__(
+            str(destino), pagesize=PAGINA,
+            leftMargin=MARGEM_LATERAL, rightMargin=MARGEM_LATERAL,
+            topMargin=MARGEM_SUPERIOR, bottomMargin=MARGEM_INFERIOR,
+            title=titulo, author="Relatório BFO",
+        )
+        self.contexto = {
+            "titulo": titulo, "competencia": competencia, "marca": marca,
+            "nota_cambial": nota_cambial, "secoes": {}, "cambiais": set(),
+            "cambial_ativo": False,
+        }
+        moldura = Frame(MARGEM_LATERAL, MARGEM_INFERIOR, LARGURA_UTIL, ALTURA_UTIL,
+                        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+                        id="corpo")
+        self.addPageTemplates([PageTemplate(id="BFO", frames=[moldura])])
+
+    def afterFlowable(self, flowable) -> None:
+        """Alimenta o índice, o título do cabeçalho e a marcação cambial."""
+        if self.contexto.get("cambial_ativo"):
+            self.contexto["cambiais"].add(self.page)
+        if not isinstance(flowable, Paragraph):
+            return
+        estilo = flowable.style.name
+        if estilo in ("titulo", "subtitulo"):
+            texto = flowable.getPlainText()
+            nivel = 0 if estilo == "titulo" else 1
+            self.notify("TOCEntry", (nivel, texto, self.page))
+
+    def construir(self, historia: Sequence) -> None:
+        # Cada passagem do multiBuild repagina: o que foi recolhido na anterior
+        # já não vale, por isso limpa-se antes de voltar a recolher.
+        self.contexto["secoes"].clear()
+        self.contexto["cambiais"].clear()
+        self.contexto["cambial_ativo"] = False
+
+        def fabrica(*args, **kwargs):
+            return _CanvasNumerado(*args, contexto=self.contexto, **kwargs)
+        self.multiBuild(list(historia), canvasmaker=fabrica)
+
+
+def titulo_pagina(texto: str) -> Paragraph:
+    return Paragraph(texto, ESTILOS["titulo"])
+
+
+def titulo_capa(texto: str) -> Paragraph:
+    return Paragraph(texto, ESTILOS["capa"])
+
+
+def rotulo_capa(texto: str) -> Paragraph:
+    return Paragraph(texto, ESTILOS["capa_sub"])
+
+
+def abre_secao(texto: str, minimo: float = 0.42) -> list:
+    """Começa uma secção sem forçar página nova.
+
+    Uma quebra fixa por secção deixaria a metade de baixo em branco, que §5 e
+    §2.1 proíbem. Em vez disso o conteúdo corre, e o salto só acontece quando
+    falta espaço para o título ter companhia — assim nunca fica um título
+    órfão no fundo da página nem uma página quase vazia. `minimo` é a fração da
+    altura útil que a secção precisa de ter à frente para começar aqui.
+    """
+    return [CondPageBreak(ALTURA_UTIL * minimo), titulo_pagina(texto)]
+
+
+def subtitulo(texto: str) -> Paragraph:
+    return Paragraph(texto, ESTILOS["subtitulo"])
+
+
+def nota(texto: str) -> Paragraph:
+    return Paragraph(texto, ESTILOS["nota"])
+
+
+# ── §11 Tabelas ───────────────────────────────────────────────────────────────
+def tabela(cabecalho: Sequence[str], linhas: Sequence[Sequence], *,
+           larguras: Sequence[float] | None = None,
+           alinhamentos: Sequence[str] = (), total: Sequence | None = None,
+           recuos: dict[int, int] | None = None,
+           negritos: Sequence[int] = ()) -> LongTable:
+    """Tabela no estilo do guia: cabeçalho claro, zebra, fios finos, total a bold.
+
+    `recuos` é `{índice da linha do corpo: nível}` e `negritos` uma lista de
+    índices — servem à hierarquia macroclasse → classe → ativo de §12, onde a
+    macroclasse vai a bold e cada nível desce um recuo. O recuo é padding real
+    da célula: espaços no texto não servem, o parágrafo apara-os.
+
+    Usa `LongTable` com `repeatRows=1`: quando a tabela transborda, o cabeçalho
+    repete-se na página seguinte (§11 e §13).
+    """
+    dados = [list(cabecalho)] + [list(linha) for linha in linhas]
     if total is not None:
-        for i, valor in enumerate(total):
-            c = ws.cell(row=r, column=coluna + i, value=valor)
-            c.style = "fo_total" if i and valor is not None else "fo_corpo"
-            if i == 0:
-                c.font = Font(name=FONT, size=10, bold=True, color=xl(INK))
-                c.fill = PatternFill("solid", fgColor="EDF3FC")
-        r += 1
-    if autofiltro and r > linha + 1:
-        ref = (f"{get_column_letter(coluna)}{linha}:"
-               f"{get_column_letter(coluna + len(nomes) - 1)}{r - 1}")
-        ws.auto_filter.ref = ref
-        ws.freeze_panes = ws.cell(row=linha + 1, column=coluna)
-    return r + 1
+        dados.append(list(total))
+
+    estilo = [
+        ("FONTNAME", (0, 0), (-1, -1), FONTE),
+        ("FONTSIZE", (0, 0), (-1, -1), PT_TABELA),
+        ("LEADING", (0, 0), (-1, -1), PT_TABELA * 1.5),
+        ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor(CINZA_TEXTO)),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        # cabeçalho: fundo #F0F2F4, texto #1A4056, semibold
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CINZA_CABECALHO)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor(AZUL_TITULO)),
+        ("FONTNAME", (0, 0), (-1, 0), FONTE_BOLD),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        # separadores finos, sem bordas grossas à volta das células
+        ("LINEBELOW", (0, 0), (-1, -2), 0.25, colors.HexColor(CINZA_GRADE)),
+    ]
+    for i in range(1, len(linhas) + 1):  # zebra branco / #FAFAFA
+        if i % 2 == 0:
+            estilo.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor(CINZA_ALTERNADO)))
+    for i, horiz in enumerate(alinhamentos):
+        estilo.append(("ALIGN", (i, 0), (i, -1), horiz.upper()))
+    for i, nivel in (recuos or {}).items():
+        estilo.append(("LEFTPADDING", (0, i + 1), (0, i + 1), 3 + 7 * nivel))
+    for i in negritos:
+        estilo.append(("FONTNAME", (0, i + 1), (-1, i + 1), FONTE_BOLD))
+    if total is not None:
+        estilo += [
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor(CINZA_CABECALHO)),
+            ("FONTNAME", (0, -1), (-1, -1), FONTE_BOLD),
+            ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor(AZUL_TITULO)),
+            ("LINEABOVE", (0, -1), (-1, -1), 0.5, colors.HexColor(CINZA_GRADE)),
+        ]
+
+    t = LongTable(dados, colWidths=larguras, repeatRows=1, hAlign="LEFT")
+    t.setStyle(TableStyle(estilo))
+    return t
 
 
-def barra_de_peso(ws: Worksheet, intervalo: str, cor: str = SERIES[0]) -> None:
-    """Barra de dados numa coluna de peso/percentagem — magnitude lida de relance."""
-    ws.conditional_formatting.add(
-        intervalo,
-        DataBarRule(start_type="num", start_value=0, end_type="max",
-                    color=xl(cor), showValue=True, minLength=None, maxLength=None),
-    )
+def tabela_indicadores(pares: Sequence[tuple[str, str]], *,
+                       largura: float = LARGURA_UTIL) -> Table:
+    """Fila de indicadores superiores (§10): rótulo pequeno, número grande.
 
-
-def kpi_tile(ws: Worksheet, linha: int, coluna: int, rotulo: str, valor,
-             *, formato: str = FMT_DINHEIRO_CURTO, delta: float | None = None,
-             delta_rotulo: str = "", largura: int = 3) -> None:
-    """Um cartão de indicador: rótulo discreto, número grande, variação com ícone.
-
-    A variação leva sempre ícone **e** palavra: quem não distingue as cores lê
-    na mesma se subiu ou desceu.
+    Sem caixas nem faixas — §5 proíbe caixas pretas e cabeçalhos coloridos em
+    excesso. A hierarquia faz-se pelo tamanho e pela cor do número.
     """
-    ws.merge_cells(start_row=linha, start_column=coluna,
-                   end_row=linha, end_column=coluna + largura - 1)
-    ws.merge_cells(start_row=linha + 1, start_column=coluna,
-                   end_row=linha + 1, end_column=coluna + largura - 1)
-    ws.merge_cells(start_row=linha + 2, start_column=coluna,
-                   end_row=linha + 2, end_column=coluna + largura - 1)
-
-    r = ws.cell(row=linha, column=coluna, value=rotulo.upper())
-    r.font = Font(name=FONT, size=8, bold=True, color=xl(MUTED))
-    r.alignment = Alignment(horizontal="left", vertical="center")
-
-    v = ws.cell(row=linha + 1, column=coluna, value=valor)
-    v.font = Font(name=FONT, size=20, bold=True, color=xl(INK))
-    v.number_format = formato
-    v.alignment = Alignment(horizontal="left", vertical="center")
-
-    d = ws.cell(row=linha + 2, column=coluna)
-    if delta is None:
-        d.value = delta_rotulo or ""
-        d.font = Font(name=FONT, size=9, color=xl(MUTED))
-    else:
-        icone = ICONE_ESTADO["bom"] if delta >= 0 else ICONE_ESTADO["critico"]
-        palavra = "acima" if delta >= 0 else "abaixo"
-        d.value = f"{icone} {abs(delta):.1f}% {palavra} {delta_rotulo}".strip()
-        d.font = Font(name=FONT, size=9, bold=True,
-                      color=xl(DELTA_BOM if delta >= 0 else ESTADO["critico"]))
-    d.alignment = Alignment(horizontal="left", vertical="center")
-
-    for offset, altura in ((0, 14), (1, 28), (2, 16)):
-        ws.row_dimensions[linha + offset].height = altura
-    for offset in range(3):
-        for i in range(largura):
-            ws.cell(row=linha + offset, column=coluna + i).fill = PatternFill(
-                "solid", fgColor=xl(PLANE))
+    rotulos = [Paragraph(r.upper(), ESTILOS["rotulo"]) for r, _ in pares]
+    valores = [Paragraph(v, ESTILOS["indicador"]) for _, v in pares]
+    t = Table([rotulos, valores], colWidths=[largura / len(pares)] * len(pares), hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("TOPPADDING", (0, 0), (-1, 0), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+        ("TOPPADDING", (0, 1), (-1, 1), 0),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+        ("LEFTPADDING", (0, 0), (0, -1), 0),
+        ("LINEBELOW", (0, 1), (-1, 1), 0.4, colors.HexColor(CINZA_GRADE)),
+        ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+    ]))
+    return t
 
 
-def faixa_kpi(ws: Worksheet, linha: int, coluna: int, tiles: Sequence[dict],
-              *, largura: int = 3, espaco: int = 1) -> int:
-    """Uma fila de cartões. Devolve a primeira linha livre abaixo."""
-    c = coluna
-    for tile in tiles:
-        kpi_tile(ws, linha, c, largura=largura, **tile)
-        c += largura + espaco
-    return linha + 4
+def grade_de_blocos(blocos: Sequence[Sequence], *, largura: float = LARGURA_UTIL,
+                    espaco: float = 6) -> Table | list:
+    """Distribui blocos em 1, 2 ou 3 colunas, conforme quantos são (§6 e §9).
+
+    Um bloco → maior e centralizado; dois → duas colunas; três → três colunas.
+    Nunca mais de três na mesma linha; o quarto começa uma linha nova.
+    """
+    if not blocos:
+        return []
+    if len(blocos) == 1:
+        return list(blocos[0])
+    colunas = min(3, len(blocos))
+    largura_coluna = (largura - espaco * (colunas - 1)) / colunas
+    linhas = [blocos[i:i + colunas] for i in range(0, len(blocos), colunas)]
+    celulas = [[list(b) for b in linha] + [""] * (colunas - len(linha)) for linha in linhas]
+    t = Table(celulas, colWidths=[largura_coluna] * colunas, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), espaco),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), espaco),
+    ]))
+    return t
 
 
 # ── Gráficos ──────────────────────────────────────────────────────────────────
-def _figura(largura_pol: float, altura_pol: float):
-    fig, ax = plt.subplots(figsize=(largura_pol, altura_pol), dpi=200)
-    fig.patch.set_facecolor(SURFACE)
-    ax.set_facecolor(SURFACE)
+def _figura(largura_pt: float, altura_pt: float, *, baixo: float = 0.22,
+            esquerda: float = 0.085, direita: float = 0.985, topo: float = 0.95):
+    """Figura dimensionada em pontos de PDF: 6 pt no gráfico é 6 pt na folha.
+
+    As margens são explícitas — e não `bbox_inches="tight"` — de propósito: o
+    corte automático muda o tamanho do PNG, e reescalá-lo para a largura da
+    mancha ampliaria também o texto, que deixaria de medir os 4,5 a 6 pt que §4
+    manda. Aqui a figura sai com o tamanho exato que ocupa na folha, e o texto
+    do gráfico mede o mesmo que o texto das tabelas ao lado.
+    """
+    fig, ax = plt.subplots(figsize=(largura_pt / 72, altura_pt / 72), dpi=300)
+    fig.subplots_adjust(left=esquerda, right=direita, top=topo, bottom=baixo)
+    fig.patch.set_facecolor(BRANCO)
+    ax.set_facecolor(BRANCO)
     for lado in ("top", "right"):
         ax.spines[lado].set_visible(False)
     for lado in ("left", "bottom"):
-        ax.spines[lado].set_color(BASELINE)
-        ax.spines[lado].set_linewidth(0.8)
-    ax.tick_params(colors=MUTED, labelsize=7.5, length=0, pad=6)
-    ax.grid(axis="y", color=GRID, linewidth=0.8)
+        ax.spines[lado].set_color(CINZA_GRADE)
+        ax.spines[lado].set_linewidth(0.5)
+    ax.tick_params(colors=CINZA_TEXTO, labelsize=PT_NOTA, length=0, pad=3)
+    ax.grid(axis="y", color=CINZA_GRADE, linewidth=0.5)  # §7: grade horizontal cinza-clara
     ax.set_axisbelow(True)
     return fig, ax
 
 
-def _titulo(ax, titulo: str, subtitulo: str = "", x: float = 0.0) -> None:
-    """Título e subtítulo alinhados à esquerda. `x` em coordenadas de eixo, para
-    encostar o título aos rótulos quando estes ficam fora da área de desenho."""
-    ax.set_title(titulo, color=INK, fontsize=11.5, fontweight="bold", loc="left",
-                 x=x, pad=18 if subtitulo else 10)
-    if subtitulo:
-        ax.text(x, 1.03, subtitulo, transform=ax.transAxes, color=MUTED, fontsize=8, va="bottom")
-
-
-def _x_dos_rotulos(fig, ax) -> float:
-    """Onde começa a coluna de rótulos do eixo y, em coordenadas de eixo."""
-    fig.canvas.draw()
-    caixa = ax.get_yaxis().get_tightbbox(fig.canvas.get_renderer())
-    if caixa is None:
-        return 0.0
-    return min(0.0, ax.transAxes.inverted().transform((caixa.x0, 0))[0])
-
-
-def _ponta_redonda(fig, ax, barras) -> None:
-    """Arredonda a **ponta de dados** das barras horizontais, sem esticar a barra.
-
-    A barra é encurtada de meio-raio e a tampa redonda repõe exatamente esse
-    meio-raio: o comprimento total continua a valer o valor. A base fica reta,
-    encostada à linha de zero — é ela que ancora a leitura.
-
-    Chamar depois de fixar `set_xlim`: o raio é calculado em píxeis e convertido
-    para unidades de dados com os limites já definidos.
-    """
-    fig.canvas.draw()
-    inv = ax.transData.inverted()
-    for barra in barras:
-        altura_px = abs(ax.transData.transform((0, barra.get_height()))[1]
-                        - ax.transData.transform((0, 0))[1])
-        raio_px = altura_px / 2
-        raio_x = inv.transform((raio_px, 0))[0] - inv.transform((0, 0))[0]
-        largura = barra.get_width()
-        if largura <= raio_x * 1.5:  # barra curta demais para valer a pena
-            continue
-        barra.set_width(largura - raio_x)
-        ax.plot(largura - raio_x, barra.get_y() + barra.get_height() / 2,
-                marker="o", markersize=altura_px * 72 / fig.dpi,
-                color=barra.get_facecolor(), markeredgewidth=0,
-                zorder=barra.zorder, clip_on=False)
-
-
-def _guardar(fig, destino: Path) -> Path:
+def _guardar(fig, destino: Path, largura_pt: float, altura_pt: float) -> Image:
+    """Grava e devolve a imagem à escala 1:1 — o PNG ocupa na folha exatamente
+    os pontos com que a figura foi criada."""
     destino.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(destino, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.12)
+    fig.savefig(destino, facecolor=BRANCO)
     plt.close(fig)
-    return destino
+    img = Image(str(destino), width=largura_pt, height=altura_pt)
+    img.hAlign = "LEFT"
+    return img
 
 
-def colar_grafico(ws: Worksheet, png: Path, ancora: str, largura_pol: float,
-                  altura_pol: float) -> None:
-    """Insere o PNG à escala certa (renderizado a 200 dpi, apresentado a 96)."""
-    img = XLImage(str(png))
-    img.width = int(largura_pol * 96)
-    img.height = int(altura_pol * 96)
-    ws.add_image(img, ancora)
+def _legenda(ax, ncols: int) -> None:
+    """Legenda horizontal abaixo do gráfico (§7). Sem caixa, em tinta de texto."""
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), frameon=False,
+              fontsize=PT_NOTA, labelcolor=CINZA_TEXTO, ncols=ncols,
+              handlelength=1.1, handleheight=0.8, columnspacing=1.6)
 
 
-def grafico_rosca(destino: Path, rotulos: Sequence[str], valores: Sequence[float],
-                  *, titulo: str, subtitulo: str = "", centro: str = "",
-                  centro_rotulo: str = "", largura: float = 5.2,
-                  altura: float = 4.0) -> Path:
-    """Composição de uma carteira. Cores por classe (fixas), buraco para o total.
+def _titulo_eixo(ax, esquerda: str, direita: str = "") -> None:
+    """§7: título da unidade em cada eixo."""
+    ax.set_ylabel(esquerda, color=CINZA_TEXTO, fontsize=PT_NOTA, labelpad=4)
+    if direita:
+        ax.right_ax.set_ylabel(direita, color=CINZA_TEXTO, fontsize=PT_NOTA, labelpad=4)
 
-    Rosca só se presta a **uma** partição de um todo com poucas fatias; acima de
-    seis fatias, barras ordenadas leem melhor.
+
+def grafico_evolucao_patrimonial(
+        destino: Path, competencias: Sequence[str],
+        entradas_saidas: Sequence[float], resultado_nao_realizado: Sequence[float],
+        patrimonio: Sequence[float], *, unidade: str = "R$",
+        largura: float = LARGURA_UTIL, altura: float = 150) -> Image:
+    """§7 — barras de movimentações + linha de património.
+
+    **Dois eixos y, por exigência do guia**: movimentações à esquerda,
+    património à direita, porque as duas grandezas não partilham escala (§7
+    "Escalas"). Cada eixo leva o título da sua unidade e a sua cor de série,
+    que é o que permite ler qual pertence a qual — sem isso, um gráfico de dois
+    eixos é ilegível.
     """
-    cores = [cor_da_classe(r) for r in rotulos]
-    fig, ax = plt.subplots(figsize=(largura, altura), dpi=200)
-    fig.patch.set_facecolor(SURFACE)
-    total = sum(valores) or 1
-    fatias, _ = ax.pie(
-        valores, colors=cores, startangle=90, counterclock=False,
-        wedgeprops=dict(width=0.34, edgecolor=SURFACE, linewidth=2),  # 2px de folga
-    )
-    # Rótulo direto nas fatias com peso; as pequenas ficam só na legenda.
+    # margem à direita para o segundo eixo caber inteiro, sem cortar rótulos
+    fig, ax = _figura(largura, altura, esquerda=0.105, direita=0.885, baixo=0.24)
+    x = range(len(competencias))
+    largura_barra = 0.38
+
+    b1 = ax.bar([i - largura_barra / 2 for i in x], entradas_saidas, largura_barra,
+                color=VERMELHO_LOCAL, label="Entradas − Saídas")
+    b2 = ax.bar([i + largura_barra / 2 for i in x], resultado_nao_realizado, largura_barra,
+                color=CINZA_MEDIO, label="Resultado não realizado")
+    ax.axhline(0, color=CINZA_TEXTO, linewidth=0.6)  # §7: linha de zero visível
+
+    eixo_p = ax.twinx()
+    ax.right_ax = eixo_p
+    eixo_p.set_facecolor("none")
+    for lado in ("top", "left", "bottom"):
+        eixo_p.spines[lado].set_visible(False)
+    eixo_p.spines["right"].set_color(CINZA_GRADE)
+    eixo_p.spines["right"].set_linewidth(0.5)
+    eixo_p.tick_params(colors=CINZA_TEXTO, labelsize=PT_NOTA, length=0, pad=3)
+    linha, = eixo_p.plot(list(x), patrimonio, color=AZUL_INTERNACIONAL, linewidth=1.2,
+                         marker="o", markersize=2.2, label="Património")
+
+    # §7 Escalas: 10% de folga acima do máximo e abaixo do mínimo, em cada eixo.
+    _folgar(ax, list(entradas_saidas) + list(resultado_nao_realizado), zero=True)
+    _folgar(eixo_p, list(patrimonio))
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(competencias, fontsize=PT_NOTA, color=CINZA_TEXTO)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: abreviado(v, unidade)))
+    eixo_p.yaxis.set_major_formatter(FuncFormatter(lambda v, _: abreviado(v, unidade)))
+    _titulo_eixo(ax, f"Movimentações ({unidade})", f"Património ({unidade})")
+
+    # §7 Rótulos: nos pontos finais, não em todos — e sem se sobreporem.
+    eixo_p.annotate(abreviado(patrimonio[-1], unidade), xy=(len(x) - 1, patrimonio[-1]),
+                    xytext=(0, 6), textcoords="offset points", ha="right",
+                    fontsize=PT_NOTA, color=AZUL_INTERNACIONAL, fontweight="bold")
+    eixo_p.annotate(abreviado(patrimonio[0], unidade), xy=(0, patrimonio[0]),
+                    xytext=(0, 6), textcoords="offset points", ha="left",
+                    fontsize=PT_NOTA, color=AZUL_INTERNACIONAL)
+
+    marcas = [b1, b2, linha]
+    ax.legend(marcas, [m.get_label() for m in marcas], loc="upper center",
+              bbox_to_anchor=(0.5, -0.16), frameon=False, fontsize=PT_NOTA,
+              labelcolor=CINZA_TEXTO, ncols=3, handlelength=1.1, handleheight=0.8)
+    return _guardar(fig, destino, largura, altura)
+
+
+def _folgar(ax, valores: Sequence[float], *, zero: bool = False) -> None:
+    """Margem mínima de 10% acima do máximo e abaixo do mínimo (§7 Escalas)."""
+    if not valores:
+        return
+    baixo, alto = min(valores), max(valores)
+    if zero:
+        baixo, alto = min(baixo, 0), max(alto, 0)
+    folga = (alto - baixo) * 0.10 or abs(alto or 1) * 0.10
+    ax.set_ylim(baixo - folga, alto + folga)
+
+
+def _rotulos_sem_sobrepor(fig, ax, altura_pt: float,
+                          rotulos: Sequence[tuple[float, str, str, bool]]) -> None:
+    """Escreve rótulos no fim de cada série sem que se toquem (§7 e §8).
+
+    Quando duas séries acabam no mesmo sítio, os rótulos empilham-se e ficam
+    ilegíveis — o guia proíbe expressamente que se sobreponham. Aqui ordenam-se
+    por altura e empurra-se cada um para cima o mínimo necessário para respeitar
+    a entrelinha; a linha continua a acabar onde acaba, só o texto se afasta.
+    """
+    fig.canvas.draw()
+    altura_eixo = ax.get_window_extent().height * 72 / fig.dpi
+    limites = ax.get_ylim()
+    minimo = (limites[1] - limites[0]) * (PT_NOTA * 1.25 / max(altura_eixo, 1))
+
+    ordenados = sorted(rotulos, key=lambda r: r[0])
+    ys = [r[0] for r in ordenados]
+    for i in range(1, len(ys)):
+        ys[i] = max(ys[i], ys[i - 1] + minimo)
+    excesso = ys[-1] - limites[1] if ys and ys[-1] > limites[1] else 0
+    for i in range(len(ys)):  # se subiu acima do topo, desce o conjunto todo
+        ys[i] -= excesso
+
+    x = ax.get_xlim()[1]
+    for y, (_, texto, cor, forte) in zip(ys, ordenados):
+        ax.annotate(texto, xy=(x, y), xytext=(3, 0), textcoords="offset points",
+                    va="center", ha="left", fontsize=PT_NOTA, color=cor,
+                    fontweight="bold" if forte else "normal", annotation_clip=False)
+
+
+def grafico_rentabilidade_acumulada(
+        destino: Path, competencias: Sequence[str],
+        series: Sequence[tuple[str, Sequence[float], bool]], *,
+        largura: float = LARGURA_UTIL, altura: float = 150) -> Image:
+    """§8 — rentabilidade acumulada composta, em percentagem.
+
+    `series` é (nome, valores, é_benchmark). A carteira consolidada vai na
+    linha de maior destaque; os benchmarks em linhas mais finas e tracejadas.
+    """
+    # margem à direita para os rótulos do último ponto de cada série (§8)
+    fig, ax = _figura(largura, altura, esquerda=0.085, direita=0.88, baixo=0.24)
+    x = range(len(competencias))
+    finais: list[tuple[float, str, str, bool]] = []
+    for i, (nome, valores, e_benchmark) in enumerate(series):
+        if e_benchmark:
+            cor, espessura, traco = CINZA_MEDIO, 0.7, (0, (3, 2))
+        else:
+            cor = AZUL_INTERNACIONAL if i == 0 else cor_de_classe(LOCAL, i)
+            espessura, traco = (1.4 if i == 0 else 1.0), "solid"
+        ax.plot(list(x), valores, color=cor, linewidth=espessura, linestyle=traco,
+                label=nome, marker="o", markevery=[-1], markersize=2.4)
+        finais.append((valores[-1], percentual(valores[-1]), cor,
+                       not e_benchmark and i == 0))
+    ax.axhline(0, color=CINZA_TEXTO, linewidth=0.6)  # §8: linha horizontal em 0%
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(competencias, fontsize=PT_NOTA, color=CINZA_TEXTO)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: eixo_percent(v)))
+    ax.set_ylabel("Rentabilidade acumulada (%)", color=CINZA_TEXTO, fontsize=PT_NOTA, labelpad=4)
+    ax.set_xlim(-0.3, len(competencias) - 1)
+    _legenda(ax, ncols=min(4, len(series)))
+    _rotulos_sem_sobrepor(fig, ax, altura, finais)   # §8: rótulo no último ponto
+    return _guardar(fig, destino, largura, altura)
+
+
+def rosca(destino: Path, rotulos: Sequence[str], valores: Sequence[float], *,
+          segmento: str = LOCAL, indices: Sequence[int] | None = None,
+          centro: str = "", centro_rotulo: str = "Património",
+          largura: float = 160, altura: float = 150) -> Image:
+    """§9 — alocação. Valor patrimonial no centro, percentagem em cada setor.
+
+    Não desenha setores falsos: se o total for zero, devolve `None` e a secção
+    mostra só a tabela ou é omitida (§9). Uma categoria única aparece com
+    `100,00%` escrito.
+    """
+    total = sum(valores)
+    if total <= 0:
+        return None
+    cores = [cor_de_classe(segmento, i) for i in (indices or range(len(rotulos)))]
+    fig, ax = plt.subplots(figsize=(largura / 72, altura / 72), dpi=300)
+    fig.patch.set_facecolor(BRANCO)
+    # Espaço em baixo para a legenda; o anel usa o resto, por isso o diâmetro
+    # acompanha o espaço que a página lhe der (§9).
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.99, bottom=0.22)
+    fatias, _ = ax.pie(valores, colors=cores, startangle=90, counterclock=False,
+                       wedgeprops=dict(width=0.30, edgecolor=BRANCO, linewidth=0.8))
     for fatia, valor in zip(fatias, valores):
         peso = valor / total
-        if peso < 0.07:
+        if peso < 0.06:  # setor pequeno fica só na legenda, para não sobrepor
             continue
-        ang = (fatia.theta2 + fatia.theta1) / 2
-        x, y = 0.83 * math.cos(math.radians(ang)), 0.83 * math.sin(math.radians(ang))
-        ax.text(x, y, f"{peso*100:.0f}%", ha="center", va="center",
-                color="#ffffff", fontsize=8.5, fontweight="bold")
+        ang = math.radians((fatia.theta1 + fatia.theta2) / 2)
+        ax.text(0.85 * math.cos(ang), 0.85 * math.sin(ang), f"{_pt_br(peso * 100, 2)}%",
+                ha="center", va="center", color=BRANCO, fontsize=PT_NOTA, fontweight="bold")
     if centro:
-        ax.text(0, 0.06, centro, ha="center", va="center", color=INK, fontsize=15, fontweight="bold")
-        ax.text(0, -0.16, centro_rotulo, ha="center", va="center", color=MUTED, fontsize=8)
-    ax.set_title(titulo, color=INK, fontsize=11.5, fontweight="bold", loc="left",
-                 pad=18 if subtitulo else 10)
-    if subtitulo:
-        ax.text(0, 1.02, subtitulo, transform=ax.transAxes, color=MUTED, fontsize=8, va="bottom")
-    ax.legend(fatias, rotulos, loc="center left", bbox_to_anchor=(1.0, 0.5),
-              frameon=False, fontsize=8, labelcolor=INK_2, handlelength=0.9, handleheight=0.9)
-    return _guardar(fig, destino)
+        ax.text(0, 0.06, centro, ha="center", va="center",
+                color=AZUL_TITULO, fontsize=PT_SUBTITULO, fontweight="bold")
+        ax.text(0, -0.16, centro_rotulo, ha="center", va="center",
+                color=CINZA_TEXTO, fontsize=PT_NOTA)
+    ax.legend(fatias, rotulos, loc="upper center", bbox_to_anchor=(0.5, 0.02),
+              frameon=False, fontsize=PT_NOTA, labelcolor=CINZA_TEXTO,
+              ncols=2, handlelength=0.8, handleheight=0.8, columnspacing=1.0)
+    return _guardar(fig, destino, largura, altura)
 
 
-def grafico_barras_empilhadas(destino: Path, categorias: Sequence[str],
-                              series: Sequence[tuple[str, Sequence[float]]],
-                              *, titulo: str, subtitulo: str = "", unidade: str = "%",
-                              largura: float = 7.6, altura: float = 4.0) -> Path:
-    """Alocação comparada entre entidades/contas. Barras horizontais, folga de 2px."""
-    fig, ax = _figura(largura, altura)
-    ax.grid(axis="y", visible=False)
-    ax.grid(axis="x", color=GRID, linewidth=0.8)
-    base = [0.0] * len(categorias)
-    for nome, valores in series:
-        barras = ax.barh(categorias, valores, left=base, height=0.42,
-                         color=cor_da_classe(nome), label=nome,
-                         edgecolor=SURFACE, linewidth=2)
-        for i, (b, v) in enumerate(zip(barras, valores)):
-            if v / (sum(s[1][i] for s in series) or 1) > 0.12:  # rótulo seletivo
-                ax.text(base[i] + v / 2, b.get_y() + b.get_height() / 2, f"{v:,.0f}",
-                        ha="center", va="center", color="#ffffff", fontsize=8, fontweight="bold")
-        base = [b + v for b, v in zip(base, valores)]
-    ax.invert_yaxis()
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}{unidade}"))
-    ax.set_ylabel("")
-    _titulo(ax, titulo, subtitulo, x=_x_dos_rotulos(fig, ax))
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK_2, ncols=min(4, len(series)),
-              loc="upper center", bbox_to_anchor=(0.5, -0.08), handlelength=0.9, handleheight=0.9)
-    return _guardar(fig, destino)
+def grafico_atribuicao(destino: Path, macroclasses: Sequence[str],
+                       valores: Sequence[float], *, unidade: str = "R$",
+                       largura: float = LARGURA_UTIL, altura: float = 120) -> Image:
+    """§10 — atribuição de performance por macroclasse, com eixo zero.
 
-
-def grafico_linha(destino: Path, eixo_x: Sequence[str],
-                  series: Sequence[tuple[str, Sequence[float]]],
-                  *, titulo: str, subtitulo: str = "", unidade: str = "",
-                  largura: float = 7.6, altura: float = 3.6) -> Path:
-    """Evolução no tempo. Um só eixo y — sempre. Rótulo direto na última observação.
-
-    Duas medidas de escala diferente (património e rendibilidade, por exemplo)
-    NÃO partilham este gráfico: ou são dois gráficos, ou vão indexadas a uma base
-    comum.
+    Positivos e negativos claramente diferenciados: vermelho institucional para
+    contribuição positiva, cinza médio para negativa (§3.3 — o vermelho é a cor
+    de destaque positivo da carteira Local; nada aqui usa cor fora da paleta).
     """
     fig, ax = _figura(largura, altura)
-    for i, (nome, valores) in enumerate(series):
-        cor = SERIES[i % len(SERIES)]
-        ax.plot(eixo_x, valores, color=cor, linewidth=2, label=nome,
-                marker="o", markevery=[-1], markersize=6,
-                markerfacecolor=cor, markeredgecolor=SURFACE, markeredgewidth=2)
-        if len(series) <= 4:  # rótulo direto, além da legenda
-            ax.annotate(f"{nome} {valores[-1]:,.0f}{unidade}",
-                        xy=(len(eixo_x) - 1, valores[-1]), xytext=(8, 0),
-                        textcoords="offset points", color=INK_2, fontsize=8,
-                        fontweight="bold", va="center")
-    ax.set_xlim(-0.2, len(eixo_x) - 0.6)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}{unidade}"))
-    ax.margins(y=0.18)
-    _titulo(ax, titulo, subtitulo)
-    if len(series) > 1:
-        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2, loc="upper left",
-                  ncols=min(4, len(series)), handlelength=1.2)
-    return _guardar(fig, destino)
+    cores = [VERMELHO_LOCAL if v >= 0 else CINZA_MEDIO for v in valores]
+    barras = ax.bar(list(macroclasses), valores, width=0.5, color=cores)
+    ax.axhline(0, color=CINZA_TEXTO, linewidth=0.6)
+    _folgar(ax, list(valores), zero=True)
+    folga = (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.02
+    for b, v in zip(barras, valores):  # §10: rótulos de valores
+        ax.text(b.get_x() + b.get_width() / 2,
+                (v + folga) if v >= 0 else (v - folga),
+                abreviado(v, unidade), ha="center",
+                va="bottom" if v >= 0 else "top",
+                fontsize=PT_NOTA, color=CINZA_TEXTO)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: abreviado(v, unidade)))
+    ax.tick_params(axis="x", labelsize=PT_NOTA, colors=CINZA_TEXTO)
+    ax.set_ylabel(f"Contribuição ({unidade})", color=CINZA_TEXTO, fontsize=PT_NOTA, labelpad=4)
+    return _guardar(fig, destino, largura, altura)
 
 
-def grafico_ranking(destino: Path, rotulos: Sequence[str], valores: Sequence[float],
-                    *, titulo: str, subtitulo: str = "", unidade: str = "",
-                    cor: str = SERIES[0], largura: float = 6.4,
-                    altura: float = 4.0) -> Path:
-    """Maiores posições. Ordem é o encoding — a cor aqui não diz nada, logo é uma só."""
-    pares = sorted(zip(rotulos, valores), key=lambda p: p[1], reverse=True)
-    nomes = [p[0] for p in pares]
-    vals = [p[1] for p in pares]
-    fig, ax = _figura(largura, altura)
-    # Sem grelha e sem eixo x: o valor vai escrito ao fim de cada barra, e a
-    # ordem já é o encoding. Um eixo aqui seria tinta a dizer o mesmo duas vezes.
-    ax.grid(visible=False)
-    ax.spines["bottom"].set_visible(False)
-    ax.tick_params(axis="x", labelbottom=False)
-    ax.set_xlim(0, max(vals) * 1.26 if vals else 1)
-    barras = ax.barh(nomes, vals, height=0.52, color=cor)
-    ax.invert_yaxis()
-    _ponta_redonda(fig, ax, barras)
-    for b, v in zip(barras, vals):  # valor em tinta de texto, nunca na cor da série
-        ax.text(v * 1.03, b.get_y() + b.get_height() / 2, f"{v:,.0f}{unidade}",
-                va="center", ha="left", color=INK_2, fontsize=8, fontweight="bold")
-    ax.tick_params(axis="y", labelsize=8, colors=INK_2)
-    _titulo(ax, titulo, subtitulo, x=_x_dos_rotulos(fig, ax))
-    return _guardar(fig, destino)
+def grafico_vencimentos(destino: Path, competencias: Sequence[str],
+                        valores: Sequence[float], *, unidade: str = "R$",
+                        largura: float = LARGURA_UTIL, altura: float = 110) -> Image:
+    """§14 — fluxo de vencimentos dos próximos 12 meses.
 
-
-def grafico_cascata(destino: Path, etapas: Sequence[tuple[str, float, bool]],
-                    *, titulo: str, subtitulo: str = "", unidade: str = "",
-                    largura: float = 7.6, altura: float = 3.8) -> Path:
-    """Da posição de abertura à de fecho, rubrica a rubrica.
-
-    `etapas` é (rótulo, valor, é_total). Polaridade usa o par divergente
-    (positivo/negativo) — não as cores de estado, que ficam reservadas.
+    Rótulo só sobre as barras relevantes — o guia pede "rótulo de valor sobre
+    barras relevantes", não sobre todas.
     """
     fig, ax = _figura(largura, altura)
-    base = 0.0
-    xs, alturas, bases, cores, niveis = [], [], [], [], []
-    for rotulo, valor, e_total in etapas:
-        xs.append(rotulo)
-        if e_total:
-            bases.append(0.0); alturas.append(valor); cores.append(SEQ[10])
-            base = valor
-        else:
-            bases.append(base); alturas.append(valor)
-            cores.append(DIVERGENTE["positivo"] if valor >= 0 else DIVERGENTE["negativo"])
-            base += valor
-        niveis.append(base)
-    barras = ax.bar(xs, alturas, bottom=bases, width=0.58, color=cores,
-                    edgecolor=SURFACE, linewidth=2)
-    # Conectores: ligam o fim de uma rubrica ao início da seguinte. São eles que
-    # tornam legível uma rubrica pequena demais para se ver como barra.
-    for i in range(len(etapas) - 1):
-        ax.plot([i + 0.30, i + 1 - 0.30], [niveis[i], niveis[i]],
-                color=BASELINE, linewidth=0.9, linestyle=(0, (3, 3)), zorder=0)
-    ax.axhline(0, color=BASELINE, linewidth=0.8)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}{unidade}"))
-    ax.tick_params(axis="x", labelsize=8, colors=INK_2)
+    barras = ax.bar(list(competencias), valores, width=0.55, color=AZUL_INTERNACIONAL)
+    maximo = max(valores) if valores else 0
+    for b, v in zip(barras, valores):
+        if maximo and v >= maximo * 0.25:
+            ax.text(b.get_x() + b.get_width() / 2, v + maximo * 0.03,
+                    abreviado(v, unidade), ha="center", va="bottom",
+                    fontsize=PT_NOTA, color=CINZA_TEXTO)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: abreviado(v, unidade)))
+    ax.tick_params(axis="x", labelsize=PT_NOTA, colors=CINZA_TEXTO)
+    ax.set_ylabel(f"Vencimentos ({unidade})", color=CINZA_TEXTO, fontsize=PT_NOTA, labelpad=4)
     ax.margins(y=0.16)
-    folga = (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.015
-    for (rotulo, valor, e_total), b, fundo in zip(etapas, barras, bases):
-        topo = max(fundo, fundo + valor)
-        ax.text(b.get_x() + b.get_width() / 2, topo + folga,
-                f"{valor:,.0f}" if e_total else f"{valor:+,.0f}",
-                ha="center", va="bottom", color=INK_2, fontsize=8, fontweight="bold")
-    _titulo(ax, titulo, subtitulo)
-    return _guardar(fig, destino)
+    return _guardar(fig, destino, largura, altura)
